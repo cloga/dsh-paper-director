@@ -753,7 +753,14 @@ $('load-history').addEventListener('click', () => task(loadHistory));
 $('manual-markers').addEventListener('toggle', () => { if ($('manual-markers').open && state.project) drawMarkers(); });
 for (const event of ['timeupdate', 'seeking', 'ratechange']) $('recording-player').addEventListener(event, checkSnippet);
 for (const event of ['pause', 'ended', 'emptied']) $('recording-player').addEventListener(event, () => { if ($('recording-player').paused || $('recording-player').ended) stopSnippet(false); });
-document.addEventListener('play', event => { if (event.target instanceof HTMLMediaElement) document.querySelectorAll('audio,video').forEach(media => { if (media !== event.target) media.pause(); }); }, true);
+document.addEventListener('play', event => {
+  if (!(event.target instanceof HTMLMediaElement)) return;
+  // pause() changes the media flag synchronously, but its event arrives later.
+  // Clear the snippet BEFORE another player pauses it, so immediate manual
+  // playback cannot be stopped by a stale range timer/seeking handler.
+  if (event.target !== $('recording-player')) stopSnippet();
+  document.querySelectorAll('audio,video').forEach(media => { if (media !== event.target) media.pause(); });
+}, true);
 window.addEventListener('beforeunload', event => { if (state.dirty.size || state.markerDirty || state.recorder || state.pendingRecording) { event.preventDefault(); event.returnValue = ''; } });
 window.addEventListener('pagehide', () => { stopPolling(); clearInterval(state.recordTimer); state.stream?.getTracks().forEach(track => track.stop()); });
 await Promise.all([refreshHealth(), listProjects().catch(error => notice(friendly(error), 'error'))]);

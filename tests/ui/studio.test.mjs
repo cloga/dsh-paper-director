@@ -425,11 +425,14 @@ test('mock review original-range playback seeks original recording, stops bounde
   assert.equal(state.requests.filter(r => r.endpoint.includes('/reviews/')).length, 0, 'listening never applies a cut');
   await page.getByRole('button', { name: '试听原段', exact: true }).click();
   await page.waitForFunction(() => !document.getElementById('recording-player').paused);
-  await page.locator('#movie-player').evaluate(player => player.dispatchEvent(new Event('play')));
-  await page.waitForFunction(() => document.getElementById('recording-player').paused);
-  // Once another player interrupts the snippet, manual whole-recording playback
-  // is not constrained by the old snippet's timer or timeupdate listener.
-  await page.locator('#recording-player').evaluate(async player => { player.currentTime = 2; await player.play(); });
+  // Interrupt and resume in the SAME task, before the delayed pause event.
+  // This makes the CI-discovered stale-snippet race a deterministic regression.
+  await page.evaluate(async () => {
+    document.getElementById('movie-player').dispatchEvent(new Event('play'));
+    const player = document.getElementById('recording-player');
+    if (!player.paused) throw new Error('Other playback must pause the original recording');
+    player.currentTime = 2; await player.play();
+  });
   await page.waitForFunction(() => document.getElementById('recording-player').currentTime > 2.3);
   assert.equal(await page.locator('#recording-player').evaluate(player => player.paused), false);
   await page.locator('#recording-player').evaluate(player => player.pause());
