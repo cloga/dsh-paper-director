@@ -4,6 +4,24 @@
 
 > **v0.1.0 预览版**：独立的 DSH 插件＋儿童创作工作室，面向成人监督的本机使用。支持整段录音、Agent异步制作接续、试听确认剪辑和真实MP4导出。请先读 [安装步骤](docs/install.md)、[版本范围](docs/v0.1-scope.md) 和 [验证说明](docs/verification.md)。发布状态与源码版本以 [GitHub Releases](https://github.com/cloga/dsh-paper-director/releases) 为准。
 
+## 先看一遍，再开始
+
+![纸上小导演真实隔离工作室导览：构思、排图写台词、整段录音、人工标时和看电影](docs/media/studio-flow.gif)
+
+*约 8 秒关键帧导览，不是实时制作耗时。真实隔离 UI＋真实 Core 渲染；全部使用匿名几何图片、合成音调和人工时间标记，没有真人麦克风录制、真实 ASR 或收费模型调用，不是“全自动 AI 真人演示”。GIF 无音轨；演示图片在仓库查看，不随安装包分发。*
+
+- **成人第一次安装**：[图文上手](docs/quick-start.md#adult-install) → [完整安装与安全说明](docs/install.md)。
+- **准备 Python / 模型**：[配置关系图与完整示例](docs/quick-start.md#adult-configure)；本地 ASR 可选，没有模型也能为同一段录音人工标时。
+- **陪孩子做第一部电影**：[构思、排图与整段录音](docs/quick-start.md#child-create) → [试听、看电影与修改](docs/quick-start.md#watch-edit)。
+
+由成人确认原 GUI 使用的真实 Profile 与 `DSH_HOME`，替换 `<真实profile>` 后执行（会联网并修改该 Profile 的依赖）：
+
+```sh
+dsh plugin --profile <真实profile> add github:cloga/dsh-paper-director#v0.1.0 --ignore-scripts
+```
+
+这只安装插件包，**用户 preset 仍须从审核过的源码/解压包普通目录单独安装**，不能修改 shipped preset 或覆盖已有目标。随后配置 Python、完成成人验收，重启**原 Profile**并刷新**原 GUI**；不要另起服务器冒充更新完成。详细步骤与两张解释型安装/配置图见 [图文上手](docs/quick-start.md)。
+
 ## 创作流程
 
 1. 孩子先有故事构思。
@@ -48,7 +66,7 @@ npm run demo
 
 Python demo 使用新生成的匿名几何图片和音调；provided transcript 是显式测试输入，不冒充识别真实语音。真实ASR需要管理员准备本地模型，程序不自动下载模型或上传孩子的录音。
 
-浏览器 UI 测试和媒体内核验证的边界分别见 [UI测试说明](tests/ui/README.md) 与 [媒体验证](tests/python/VERIFICATION.md)。正式安装/打包说明正在完善，底层接入协议见 [DSH集成](docs/dsh-integration.md)。
+浏览器 UI 测试和媒体内核验证的边界分别见 [UI测试说明](tests/ui/README.md) 与 [媒体验证](tests/python/VERIFICATION.md)。正式安装/打包步骤见 [安装与验证](docs/install.md)，首次使用见 [图文上手](docs/quick-start.md)，底层接入协议见 [DSH集成](docs/dsh-integration.md)。
 
 ## 隐私与素材
 

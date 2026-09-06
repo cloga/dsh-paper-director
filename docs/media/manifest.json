@@ -1,0 +1,70 @@
+{
+  "license": "MIT",
+  "source": "Original explanatory diagrams and isolated real UI captures; generated anonymous geometry/oscillator audio only.",
+  "files": [
+    {
+      "file": "install-overview.png",
+      "format": "PNG",
+      "width": 1000,
+      "height": 650,
+      "frames": 1,
+      "bytes": 95829,
+      "sha256": "40ded511fe633dfa425238c07cbad51b45cf5787030d0f260e490e47dbea84a2"
+    },
+    {
+      "file": "configuration-map.png",
+      "format": "PNG",
+      "width": 1000,
+      "height": 650,
+      "frames": 1,
+      "bytes": 108496,
+      "sha256": "0fc2a83ee4d888a16efb782d200300c3525546981206883fe7b7cf2f28bcbcfc"
+    },
+    {
+      "file": "storyboard.png",
+      "format": "PNG",
+      "width": 1000,
+      "height": 700,
+      "frames": 1,
+      "bytes": 60486,
+      "sha256": "54712263829b0169059c4fcca58d4ae14e194ef48aa59b090c7ea831d8bd93b2"
+    },
+    {
+      "file": "recording.png",
+      "format": "PNG",
+      "width": 1000,
+      "height": 700,
+      "frames": 1,
+      "bytes": 75502,
+      "sha256": "4d004b0022909f087d4791761f268ed8d161b1427c564ccf8493a4168a756f77"
+    },
+    {
+      "file": "review.png",
+      "format": "PNG",
+      "width": 1000,
+      "height": 700,
+      "frames": 1,
+      "bytes": 64849,
+      "sha256": "4d3205917e3e53a5e2b42d6549db4831054da7b855cc5423526e4b439ba39b81"
+    },
+    {
+      "file": "movie.png",
+      "format": "PNG",
+      "width": 1000,
+      "height": 700,
+      "frames": 1,
+      "bytes": 248214,
+      "sha256": "9e60b3c817df52528cce94bdf65c8bb5b17493753510f9dc872651deabc7eaee"
+    },
+    {
+      "file": "studio-flow.gif",
+      "format": "GIF",
+      "width": 1000,
+      "height": 742,
+      "frames": 5,
+      "bytes": 316901,
+      "sha256": "5648fabc8d042c1ef82d0b0bf802f72dcca2067442c57a821a9b9641f0ed454b",
+      "duration_ms": 7700
+    }
+  ]
+}
