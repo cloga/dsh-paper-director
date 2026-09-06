@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>纸上小导演 · 把你的故事拍成电影</title>
+  <link rel="stylesheet" href="/paper-director/static/studio.css">
+  <script type="module" src="/paper-director/static/studio.js"></script>
+</head>
+<body>
+  <a class="skip" href="#studio">跳到我的故事</a>
+  <header class="masthead">
+    <a class="brand" href="/paper-director/" aria-label="纸上小导演首页"><span class="brand-icon" aria-hidden="true">▣</span><span>纸上小导演<small>你的故事，你来当导演</small></span></a>
+    <div class="header-actions"><span id="readiness" class="chip" role="status">正在看看工作室准备好了没…</span><button id="refresh-health" class="quiet" type="button">检查工作室</button></div>
+  </header>
+  <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+  <div class="workspace">
+    <aside class="shelf" aria-label="我的作品">
+      <div class="section-heading"><h2>我的小影院</h2><span aria-hidden="true">✦</span></div>
+      <button id="new-project" type="button" class="primary wide">＋ 开始一个新故事</button>
+      <div id="projects" class="project-list"><p class="muted">正在拿出你的故事本…</p></div>
+      <div class="shelf-note"><span aria-hidden="true">✂</span><p>先想故事，再排照片。<br>整段录一次，剩下的<br>交给导演助手。</p></div>
+    </aside>
+    <main id="studio" tabindex="-1">
+      <section id="welcome" class="welcome paper"><span class="eyebrow">每个小故事，都值得一场首映</span><h1>照片会动，<br>想象会发光。</h1><p>把纸偶、玩具或画作排成故事，再用自己的声音讲出来。</p><button id="welcome-create" class="primary" type="button">我的第一部电影 →</button><div class="paper-puppets" aria-hidden="true"><span class="puppet one">✦</span><span class="puppet two">◷</span></div></section>
+      <div id="editor" hidden>
+        <div class="editor-title"><div><span class="eyebrow">导演的故事本</span><h1 id="project-title">我的纸上故事</h1><p id="revision" class="muted"></p></div><div class="save-area"><span id="save-state" role="status">已保存</span><button id="save" type="button" class="primary">保存故事本</button></div></div>
+        <nav class="steps" aria-label="拍电影的五个步骤"><a href="#idea"><b>1</b>想故事</a><a href="#photos"><b>2</b>排照片</a><a href="#record"><b>3</b>整段录音</a><a href="#make"><b>4</b>交给助手</a><a href="#watch"><b>5</b>看电影</a></nav>
+        <section id="idea" class="paper section-card"><div class="section-heading"><h2><span class="step-number">01</span> 这个故事，想说什么？</h2><span class="sticker">想象力开机</span></div>
+          <div class="two-col"><label>电影名字<input id="title" maxlength="120" placeholder="例如：时钟里的小旅行"></label><label>小导演署名<input id="director" maxlength="80" placeholder="你的名字或昵称"></label></div>
+          <label>我的故事想法<textarea id="story" maxlength="8000" rows="4" placeholder="谁出发了？遇见了什么？最后发生了什么？写下你自己的点子。"></textarea></label>
+          <label class="short-field">声音演员署名<input id="voice" maxlength="80" placeholder="是谁讲的这个故事？"></label>
+          <div class="section-heading cast-heading"><h3>认识我们的主角</h3><button id="add-character" type="button" class="quiet">＋ 加一个角色</button></div><div id="characters" class="cast"></div>
+        </section>
+        <section id="photos" class="paper section-card"><div class="section-heading"><h2><span class="step-number">02</span> 照片排好，故事就出发</h2><label class="button secondary upload-label">＋ 放进照片<input id="photo-files" type="file" accept="image/png,image/jpeg,image/webp" multiple></label></div><p class="muted">按故事发生的顺序摆放。每张照片写上动作和台词，不用为每一幕单独录音。</p><div id="scenes" class="scenes"></div></section>
+        <section id="record" class="paper section-card"><div class="section-heading"><h2><span class="step-number">03</span> 从头到尾，讲一遍</h2><span class="sticker mint">只需一整段录音</span></div><p>照着照片顺序讲故事。停顿、笑声和没写在台词里的话，也属于你的表演。</p><div class="record-actions"><button id="start-recording" type="button" class="record-button">● 开始整段录音</button><button id="stop-recording" type="button" class="secondary" hidden>■ 结束并保留录音</button><button id="retry-recording" type="button" class="secondary" hidden>重试保存刚才的录音</button><span id="recording-status" role="status"></span><label class="button quiet upload-label">或选择已有录音<input id="audio-file" type="file" accept="audio/*"></label></div><audio id="recording-player" controls preload="metadata" aria-label="完整原始录音" hidden></audio><p id="recording-info" class="muted">还没有录音。上传或录制一整段就好。</p></section>
+        <section id="make" class="paper section-card"><div class="section-heading"><h2><span class="step-number">04</span> 导演助手，开工啦！</h2><span aria-hidden="true">✦</span></div><p>助手会尊重你写的故事，把照片、整段声音、字幕和纸艺效果编成电影。没有准备好的功能，会老实告诉你。</p><p class="muted">交给助手时，故事、台词和转写文字会发送给家长选择的AI（可能联网并产生费用）。原始录音不用于云端转写。请先让大人确认设置。</p><label>想特别告诉助手的事<textarea id="agent-prompt" rows="2" maxlength="4000" placeholder="例如：穿越时空的时候加一个发光的圈，心里话用小气泡。"></textarea></label><div class="action-row"><button id="agent-create" type="button" class="primary">✦ 交给导演助手</button><button id="auto-align" type="button" class="secondary">自动听录音、对台词</button><button id="preview" type="button" class="secondary">制作预览</button><button id="export" type="button" class="quiet">制作正式电影</button></div><p id="agent-status" class="muted" role="status"></p><div id="agent-messages" aria-label="导演助手最近的回复" aria-live="polite"></div><div id="review-cards" aria-label="等你确认的修改" aria-live="polite"></div><div id="alignment-status" class="alignment-status"></div><div id="jobs" class="jobs" aria-live="polite"></div>
+          <details id="manual-markers"><summary>自动对齐暂时不能用？请大人帮忙标记时间</summary><p>这是<strong>人工标记</strong>，不是机器识别。播放上面的整段录音，在每句实际说出的开始和结束处填时间。未标记的声音不能当成安静，也不会自动剪掉。</p><div id="markers" class="markers"></div><h4>还有没写在台词里的话吗？</h4><p class="muted">把额外的话也记下来，避免它被当成空白。</p><div id="extra-markers"></div><button id="add-extra-marker" type="button" class="quiet">＋ 记一段额外的话</button><div class="action-row"><button id="submit-markers" type="button" class="secondary">保存人工时间标记</button></div></details>
+        </section>
+        <section id="watch" class="paper section-card"><div class="section-heading"><h2><span class="step-number">05</span> 欢迎来到你的首映礼</h2><span class="sticker">导演请入座</span></div><div id="movie-empty" class="empty-screen"><span aria-hidden="true">▷</span><p>电影做好后，会出现在这里。</p></div><video id="movie-player" controls preload="metadata" playsinline aria-label="我的电影" hidden></video><p id="movie-info" class="muted"></p><label>再改一点点？告诉导演助手<textarea id="feedback" rows="3" maxlength="4000" placeholder="例如：第二张照片多停一会儿；心里想的话变成小气泡。"></textarea></label><button id="send-feedback" type="button" class="primary">把我的修改告诉助手 →</button><details class="history"><summary>翻翻以前的版本</summary><p class="muted">恢复会变成一个新版本，不会抹掉原来的故事。</p><button id="load-history" type="button" class="quiet">查看版本</button><div id="history-list"></div></details></section>
+      </div>
+      <footer>故事属于你。原照片和整段录音会保留，每次修改都有新版本。</footer>
+    </main>
+  </div>
+</body>
+</html>

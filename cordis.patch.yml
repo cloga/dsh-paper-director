@@ -1,0 +1,13 @@
+# Only the shared Host owner belongs here. Tools mount per dedicated Agent.
+- insert:
+    - id: paper-director
+      name: dsh-paper-director
+      config:
+        dataDir: !!js dshHomePath('paper-director')
+        pythonPath: python
+        fontPath: ''
+        asrModelPath: ''
+        asrEngine: whisper
+        allowCloudTts: false
+        azureRegion: ''
+        azureKeyEnv: AZURE_SPEECH_KEY
