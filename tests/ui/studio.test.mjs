@@ -57,9 +57,15 @@ async function setup(browser, synthesizeMicrophone = false) {
   });
   const page = await context.newPage();
   const state = { project: null, jobs: [], requests: [], errors: [], conflict: false, serial: 0, keepRunning: false,
+    review: { agent: { liveStatus: 'cold', lastTurnReason: null, messages: [] }, proposals: [] }, rejectConfirm: false, reviewConflict: false,
     agentError: false, health: { render: { ready: true }, alignment: { configured: false, engine: '' }, agent: { configured: false }, narration: { configured: false }, worker: { available: true, missing: [] } } };
   page.on('pageerror', error => state.errors.push(error.message));
-  page.on('dialog', dialog => dialog.accept());
+  state.dialogs = []; state.confirmAnswers = [];
+  page.on('dialog', dialog => {
+    state.dialogs.push(dialog.message());
+    const accept = state.confirmAnswers.length ? state.confirmAnswers.shift() : !state.rejectConfirm;
+    return accept ? dialog.accept() : dialog.dismiss();
+  });
   const png = syntheticPng();
   await page.route('**/*', async route => {
     const request = route.request(), url = new URL(request.url());
@@ -82,14 +88,14 @@ async function setup(browser, synthesizeMicrophone = false) {
     if (endpoint === '/projects' && method === 'POST') { state.project = initial(); return ok(state.project); }
     if (endpoint === '/projects/project-one' && method === 'GET') return ok(state.project);
     if (endpoint === '/projects/project-one' && method === 'PATCH') {
-      if (state.conflict) { state.conflict = false; state.project.title = '另一处保存的新版本'; state.project.revision++; return error('REVISION_CONFLICT', 409); }
+      if (state.conflict) { state.conflict = false; state.project.title = '另一处保存的新版本'; state.project.revision++; return error(state.conflictCode || 'REVISION_CONFLICT', 409); }
       if (body.expectedRevision !== state.project.revision) return error('REVISION_CONFLICT', 409);
       Object.assign(state.project, body.patch); state.project.revision++;
       if (['scenes', 'characters', 'recordingAssetId'].some(key => key in body.patch)) state.project.alignment = null;
       return ok(state.project);
     }
     if (endpoint === '/projects/project-one/assets' && method === 'POST') {
-      assert.equal(Number(request.headers()['x-project-revision']), state.project.revision);
+      if (Number(request.headers()['x-project-revision']) !== state.project.revision) return error('REVISION_CONFLICT', 409);
       if (state.uploadFailure) { state.uploadFailure = false; return error('UPLOAD_FAILED', 503); }
       const kind = request.headers()['x-asset-kind'];
       const asset = { id: `asset-${++state.serial}`, kind, name: decodeURIComponent(request.headers()['x-file-name']), mime: request.headers()['content-type'], metadata: kind === 'audio' ? { duration: 4 } : { width: 300, height: 240 } };
@@ -125,6 +131,17 @@ async function setup(browser, synthesizeMicrophone = false) {
       const kind = endpoint.split('/').at(-1), job = { id: `job-${++state.serial}`, projectId: state.project.id, kind, revision: body.expectedRevision, status: 'running', progress: .2, stage: 'working', result: null, error: null };
       if (body.segments) job.segments = body.segments;
       state.jobs.unshift(job); return ok(job);
+    }
+    if (endpoint === '/projects/project-one/review') return ok({ projectId: state.project.id, revision: state.project.revision, ...state.review });
+    if (endpoint.startsWith('/projects/project-one/reviews/')) {
+      if (state.reviewConflict || body.expectedRevision !== state.project.revision) {
+        state.reviewConflict = false; state.project.revision++; state.project.title = '服务器上的新标题'; state.review.proposals = [];
+        return error('REVISION_CONFLICT', 409);
+      }
+      assert.deepEqual(Object.keys(body).sort(), ['decision', 'expectedRevision']);
+      state.review.proposals = state.review.proposals.filter(p => p.id !== endpoint.split('/').at(-1));
+      if (body.decision === 'apply') state.project.revision++;
+      return ok(state.project);
     }
     if (endpoint === '/projects/project-one/agent') return state.agentError ? error('AGENT_NOT_CONFIGURED') : ok({ sessionId: 'agent-session-one' });
     if (endpoint.endsWith('/history')) return ok([{ revision: state.project.revision }, { revision: 1 }]);
@@ -200,11 +217,20 @@ test('child studio: authored story → ordered photos → ONE recording → expl
   await page.locator('#agent-prompt').fill('请尊重我的故事，时间旅行加光圈。');
   await page.locator('#agent-create').click();
   await page.waitForFunction(() => document.getElementById('agent-status').textContent.includes('已交给导演助手'));
+  const watchedExport = { ...state.project.exports.at(-1) };
+  await page.locator('#movie-player').evaluate(player => Object.defineProperty(player, 'currentTime', { configurable: true, value: 1.25 }));
+  // A new server export arrives before save redraws: feedback must still describe
+  // the old export actually being watched when the author clicks send.
+  state.project.exports.push({ assetId: 'movie-newer', inputRevision: state.project.revision, preview: true });
+  await page.locator('#title').fill('纸偶与时间之门 · 修改中');
   await page.locator('#feedback').fill('第二张照片多停一会儿。');
   await page.locator('#send-feedback').click();
   await page.waitForFunction(() => !document.getElementById('send-feedback').disabled);
   const agentCalls = state.requests.filter(r => r.endpoint.endsWith('/agent'));
-  assert.equal(agentCalls.length, 2); assert.equal(agentCalls[1].body.prompt, '第二张照片多停一会儿。');
+  assert.equal(agentCalls.length, 2); assert.match(agentCalls[1].body.prompt, /^第二张照片多停一会儿。\n\n当前观看电影：assetId=movie-/);
+  assert.ok(agentCalls[1].body.prompt.includes(`assetId=${watchedExport.assetId}；inputRevision=${watchedExport.inputRevision}`));
+  assert.doesNotMatch(agentCalls[1].body.prompt, /assetId=movie-newer/);
+  assert.match(agentCalls[1].body.prompt, /currentTime=1.25 秒/);
   await page.evaluate(() => { document.activeElement?.blur(); scrollTo(0, 0); });
   await page.screenshot({ path: path.join(OUT, 'studio-desktop.png'), fullPage: true });
   await page.screenshot({ path: path.join(OUT, 'studio-desktop-top.png'), fullPage: false });
@@ -226,8 +252,13 @@ test('truthful errors, conflict protection, job cancellation, restore and text-o
   assert.match(await page.locator('#project-title').innerText(), /<img/);
   state.conflict = true;
   await page.locator('#title').fill('我的旧版本不能覆盖别人'); await page.locator('#save').click();
-  await page.waitForFunction(() => document.getElementById('title').value === '另一处保存的新版本');
-  assert.match(await page.locator('#notice').innerText(), /没有覆盖/);
+  await page.waitForFunction(() => document.getElementById('notice').textContent.includes('这次没有覆盖'));
+  assert.equal(await page.locator('#title').inputValue(), '我的旧版本不能覆盖别人');
+  assert.equal(state.project.title, '另一处保存的新版本');
+  assert.match(await page.locator('#save-state').innerText(), /还没保存/);
+  await page.locator('#save').click();
+  await page.waitForFunction(() => document.getElementById('save-state').textContent === '已保存');
+  assert.equal(state.project.title, '我的旧版本不能覆盖别人');
   state.health.agent.configured = true; state.agentError = true;
   await page.locator('#refresh-health').click(); await page.waitForFunction(() => !document.getElementById('agent-create').disabled);
   await page.locator('#agent-create').click();
@@ -261,12 +292,25 @@ test('real MediaRecorder captures one synthetic stream and retains it when uploa
   await page.locator('#start-recording').click();
   await page.locator('#stop-recording').waitFor({ state: 'visible' });
   await page.waitForFunction(() => window.syntheticAudioContext?.currentTime > .4);
+  state.review.agent = { liveStatus: 'running', lastTurnReason: null, messages: [{ text: '录音时也能看到助手消息。' }] };
+  state.project.revision++;
+  await page.getByText('录音时也能看到助手消息。', { exact: true }).waitFor();
+  assert.equal(await page.locator('#stop-recording').isVisible(), true, 'review does not stop active microphone capture');
+  assert.match(await page.locator('#recording-status').innerText(), /正在录一整段/);
+  state.project.revision--; // Controlled mock status update; no real concurrent author mutation.
   state.uploadFailure = true;
   await page.locator('#stop-recording').click();
   await page.waitForFunction(() => !document.getElementById('retry-recording').hidden && !document.getElementById('retry-recording').disabled);
   assert.match(await page.locator('#recording-player').getAttribute('src'), /^blob:/);
   assert.match(await page.locator('#recording-info').innerText(), /尚未成功保存/);
   assert.equal(state.project.recordingAssetId, null);
+  const pendingSrc = await page.locator('#recording-player').getAttribute('src');
+  state.review.agent.messages = [{ text: '录音上传失败后仍保留在页面。' }];
+  state.project.revision++;
+  await page.getByText('录音上传失败后仍保留在页面。', { exact: true }).waitFor();
+  assert.equal(await page.locator('#recording-player').getAttribute('src'), pendingSrc, 'review never replaces pending recording blob');
+  assert.equal(await page.locator('#retry-recording').isVisible(), true);
+  state.project.revision--;
   await page.locator('#retry-recording').click();
   await page.waitForFunction(() => document.getElementById('retry-recording').hidden && !document.getElementById('audio-file').disabled);
   assert.ok(state.project.recordingAssetId);
@@ -284,6 +328,282 @@ test('real MediaRecorder captures one synthetic stream and retains it when uploa
   assert.equal(await page.evaluate(() => window.otherPlayerPaused), 1, 'another media play pauses the existing audio player');
   assert.deepEqual(state.errors, []);
   await context.close();
+});
+
+test('mock review: bounded text replies, truthful idle/running/cold, approval refusal/apply/dismiss and stale dirty preservation', async () => {
+  const { page, context, state } = await setup(browser);
+  await page.locator('#new-project').click(); await page.locator('#editor').waitFor({ state: 'visible' });
+  state.project.recordingAssetId = 'recording'; state.project.assets.push({ id: 'recording', kind: 'audio', mime: 'audio/wav', metadata: { duration: 4 } });
+  state.project.scenes.push({ id: 'scene-one', imageAssetId: null, action: '', dialogue: [{ id: 'line-one', characterId: 'hero', text: '你好', mode: 'normal' }], transition: 'cut', timeLabel: '' });
+  await page.locator('.project-card').click();
+  const proposal = id => ({ id, baseRevision: state.project.revision, currentSeconds: 2, targetSeconds: .5, sourceRange: { start: .5, end: 1.2 }, warnings: ['可能包含额外的话，请先听原段。'], requiresConfirmation: true });
+  state.review.agent = { liveStatus: 'running', lastTurnReason: null, messages: [{ id: 'reply-1', text: '我找到了停顿，请听听再决定。' }] };
+  state.review.proposals = [proposal('proposal-first')];
+  await page.getByText('我找到了停顿，请听听再决定。', { exact: true }).waitFor();
+  assert.match(await page.locator('#agent-status').innerText(), /正在整理你的电影/);
+  assert.equal(await page.locator('#agent-status').getAttribute('data-live-status'), 'running');
+  assert.doesNotMatch(await page.locator('#agent-status').innerText(), /lastTurnReason|liveStatus|running/);
+  assert.match(await page.locator('#review-cards').innerText(), /原停顿：2.00 秒 → 新停顿：0.50 秒/);
+  assert.match(await page.locator('#review-cards').innerText(), /可能包含额外的话/);
+  state.review.agent.liveStatus = 'idle'; state.review.agent.lastTurnReason = 'completed';
+  await page.waitForFunction(() => document.getElementById('agent-status').dataset.liveStatus === 'idle');
+  assert.match(await page.locator('#agent-status').innerText(), /这一轮已停下.*这一轮回复已结束/);
+  assert.doesNotMatch(await page.locator('#agent-status').innerText(), /lastTurnReason|liveStatus|idle|completed/);
+  assert.equal(await page.locator('#movie-player').isVisible(), false, 'idle is not a movie export');
+  assert.match(await page.locator('#jobs').innerText(), /没有制作工具任务/);
+  // Refusing the explicit browser confirmation MUST send no approval request.
+  state.rejectConfirm = true;
+  await page.getByRole('button', { name: '确认剪短', exact: true }).click();
+  await page.waitForFunction(() => !document.querySelector('[data-review-action="apply"]').disabled);
+  assert.equal(state.requests.filter(r => r.endpoint.includes('/reviews/')).length, 0);
+  state.rejectConfirm = false;
+  await page.getByRole('button', { name: '确认剪短', exact: true }).click();
+  await page.waitForFunction(() => document.querySelectorAll('[data-proposal-id]').length === 0);
+  assert.deepEqual(state.requests.find(r => r.endpoint.includes('/reviews/')).body, { expectedRevision: 1, decision: 'apply' });
+  assert.equal(state.project.revision, 2); assert.equal(state.project.recordingAssetId, 'recording');
+  state.review.proposals = [proposal('proposal-dismiss')];
+  await page.getByRole('button', { name: '保留原样', exact: true }).waitFor();
+  await page.getByRole('button', { name: '保留原样', exact: true }).click();
+  await page.waitForFunction(() => document.querySelectorAll('[data-proposal-id]').length === 0);
+  assert.equal(state.requests.filter(r => r.endpoint.includes('/reviews/')).at(-1).body.decision, 'dismiss');
+  assert.equal(state.project.revision, 2, 'dismiss does not change movie content');
+  state.review.proposals = [proposal('proposal-stale')];
+  await page.getByRole('button', { name: '确认剪短', exact: true }).waitFor();
+  await page.locator('#title').fill('我还没保存的标题');
+  await page.locator('#story').fill('我还没保存的故事');
+  await page.locator('#agent-prompt').fill('未发送的助手输入');
+  await page.locator('#feedback').fill('未发送的观看反馈');
+  await page.locator('#manual-markers summary').click();
+  await page.getByLabel('开始（秒）', { exact: true }).fill('0.31');
+  state.reviewConflict = true;
+  await page.getByRole('button', { name: '确认剪短', exact: true }).click();
+  await page.waitForFunction(() => document.getElementById('notice').textContent.includes('确认卡已过期'));
+  assert.equal(await page.locator('#title').inputValue(), '我还没保存的标题');
+  assert.equal(await page.locator('#story').inputValue(), '我还没保存的故事');
+  assert.equal(await page.locator('#agent-prompt').inputValue(), '未发送的助手输入');
+  assert.equal(await page.locator('#feedback').inputValue(), '未发送的观看反馈');
+  assert.equal(await page.getByLabel('开始（秒）', { exact: true }).inputValue(), '0.31');
+  assert.match(await page.locator('#save-state').innerText(), /还没保存/);
+  assert.equal(state.requests.filter(r => r.method === 'PATCH').length, 0, 'review must not auto-save author drafts');
+  // Oversized/untrusted reply fixture tests the UI guard independently of Core's guard.
+  state.review.agent = { liveStatus: 'cold', lastTurnReason: 'error', messages: Array.from({ length: 20 }, (_, i) => ({ text: i === 19 ? '<img src=x onerror="window.pwned=1">' : i === 18 ? 'C:/secret/private.txt' : '长'.repeat(10000), interrupted: i === 19 })) };
+  await page.waitForFunction(() => document.getElementById('agent-status').dataset.liveStatus === 'cold');
+  assert.match(await page.locator('#agent-status').innerText(), /暂时没有运行.*这一轮没能完成/);
+  assert.doesNotMatch(await page.locator('#agent-status').innerText(), /lastTurnReason|liveStatus|cold|error/);
+  const text = await page.locator('#agent-messages').innerText();
+  assert.ok(text.length < 8500); assert.doesNotMatch(text, /C:\/secret/);
+  assert.equal(await page.locator('#agent-messages img').count(), 0);
+  assert.equal(await page.evaluate(() => window.pwned), undefined);
+  assert.equal(await page.locator('#title').inputValue(), '我还没保存的标题');
+  state.review.agent.messages = [{ text: '<img src=x onerror="window.pwned=1">', interrupted: true }];
+  await page.waitForFunction(() => document.getElementById('agent-messages').textContent.includes('<img'));
+  assert.match(await page.locator('#agent-messages').innerText(), /被中断/);
+  assert.equal(await page.locator('#agent-messages img').count(), 0);
+  state.review.agent.messages = [];
+  state.jobs = [{ id: 'failed-job', kind: 'render', revision: 2, status: 'failed', error: { code: 'WORKER_NOT_READY' } }];
+  await page.waitForFunction(() => document.getElementById('jobs').textContent.includes('没有完成'));
+  assert.match(await page.locator('#agent-messages').innerText(), /没有可见的助手回复/);
+  assert.deepEqual(state.errors, []);
+  await context.close();
+});
+
+test('mock review original-range playback seeks original recording, stops bounded and cancels after other playback', async () => {
+  const { page, context, state } = await setup(browser);
+  await page.locator('#new-project').click(); await page.locator('#editor').waitFor({ state: 'visible' });
+  state.project.recordingAssetId = 'recording'; state.project.assets.push({ id: 'recording', kind: 'audio', mime: 'audio/wav', metadata: { duration: 4 } });
+  await page.locator('.project-card').click();
+  state.review.proposals = [{ id: 'listen-proposal', currentSeconds: .7, targetSeconds: .25, sourceRange: { start: .5, end: 1.2 }, warnings: [] }];
+  await page.getByRole('button', { name: '试听原段', exact: true }).waitFor();
+  await page.waitForFunction(() => document.getElementById('recording-player').readyState >= 1);
+  await page.getByRole('button', { name: '试听原段', exact: true }).click();
+  await page.waitForFunction(() => document.getElementById('recording-player').currentTime >= .5);
+  const position = await page.locator('#recording-player').evaluate(player => player.currentTime);
+  assert.ok(position < 1.4, `seek was into sourceRange: ${position}`);
+  assert.equal(await page.locator('#recording-player').getAttribute('src'), '/paper-director/api/projects/project-one/assets/recording');
+  await page.waitForFunction(() => { const p = document.getElementById('recording-player'); return p.paused && p.currentTime >= 1.2; });
+  assert.ok(await page.locator('#recording-player').evaluate(player => player.currentTime < 1.5), 'timer stops near range end, not end of complete recording');
+  assert.equal(state.requests.filter(r => r.endpoint.includes('/reviews/')).length, 0, 'listening never applies a cut');
+  await page.getByRole('button', { name: '试听原段', exact: true }).click();
+  await page.waitForFunction(() => !document.getElementById('recording-player').paused);
+  await page.locator('#movie-player').evaluate(player => player.dispatchEvent(new Event('play')));
+  await page.waitForFunction(() => document.getElementById('recording-player').paused);
+  // Once another player interrupts the snippet, manual whole-recording playback
+  // is not constrained by the old snippet's timer or timeupdate listener.
+  await page.locator('#recording-player').evaluate(async player => { player.currentTime = 2; await player.play(); });
+  await page.waitForFunction(() => document.getElementById('recording-player').currentTime > 2.3);
+  assert.equal(await page.locator('#recording-player').evaluate(player => player.paused), false);
+  await page.locator('#recording-player').evaluate(player => player.pause());
+  assert.deepEqual(state.errors, []);
+  await context.close();
+});
+
+test('mock conflict: dirty → review apply success → save 409 → cancel → explicit dirty-only retry', async () => {
+  const { page, context, state } = await setup(browser);
+  try {
+    await page.locator('#new-project').click(); await page.locator('#editor').waitFor({ state: 'visible' });
+    state.project.revision = 7;
+    state.project.recordingAssetId = 'recording';
+    state.project.assets.push({ id: 'recording', kind: 'audio', mime: 'audio/wav', metadata: { duration: 4 } });
+    state.project.scenes.push({ id: 'scene-one', imageAssetId: null, action: '', dialogue: [{ id: 'line-one', characterId: 'hero', text: '你好', mode: 'normal' }], transition: 'cut', timeLabel: '' });
+    await page.locator('.project-card').click();
+    await page.waitForFunction(() => document.getElementById('revision').textContent.includes('第 7 版'));
+    state.review.proposals = [{ id: 'apply-dirty', currentSeconds: 2, targetSeconds: .5, sourceRange: { start: .5, end: 1.2 }, warnings: [] }];
+    await page.getByRole('button', { name: '确认剪短', exact: true }).waitFor();
+    await page.locator('#title').fill('作者留在第七版的标题');
+    await page.locator('#agent-prompt').fill('不要丢掉助手输入');
+    await page.locator('#feedback').fill('不要丢掉观影反馈');
+    await page.locator('#manual-markers summary').click();
+    await page.getByLabel('开始（秒）', { exact: true }).fill('0.31');
+    await page.getByLabel('结束（秒）', { exact: true }).fill('1.2');
+    await page.locator('#add-extra-marker').click();
+    await page.getByLabel('额外说了什么').fill('额外的一句话');
+    const originalSrc = await page.locator('#recording-player').getAttribute('src');
+    await page.getByRole('button', { name: '确认剪短', exact: true }).click();
+    await page.waitForFunction(() => document.querySelectorAll('[data-proposal-id]').length === 0);
+    assert.equal(state.project.revision, 8);
+    assert.match(await page.locator('#revision').innerText(), /第 7 版/);
+    // Server-only fields must survive the later retry; no implicit merge happens now.
+    state.project.story = '服务器的新故事'; state.project.edits.push({ id: 'approved-cut' });
+    await page.locator('#save').click();
+    await page.waitForFunction(() => document.getElementById('notice').textContent.includes('这次没有覆盖'));
+    const patches = () => state.requests.filter(r => r.method === 'PATCH');
+    assert.equal(patches().length, 1); assert.equal(patches()[0].body.expectedRevision, 7);
+    assert.equal(state.dialogs.length, 1, '409 does not automatically ask to retry or write again');
+    assert.equal(await page.locator('#title').inputValue(), '作者留在第七版的标题');
+    assert.equal(await page.locator('#story').inputValue(), '', 'conflict snapshot is not silently merged into the draft');
+    assert.equal(await page.getByLabel('开始（秒）', { exact: true }).inputValue(), '0.31');
+    assert.equal(await page.getByLabel('额外说了什么').inputValue(), '额外的一句话');
+    assert.equal(await page.locator('#recording-player').getAttribute('src'), originalSrc);
+    state.rejectConfirm = true;
+    await page.locator('#save').click();
+    await page.waitForFunction(() => document.getElementById('notice').textContent.includes('已取消保存'));
+    assert.equal(patches().length, 1); assert.match(await page.locator('#save-state').innerText(), /还没保存/);
+    assert.match(await page.locator('#revision').innerText(), /第 7 版/);
+    assert.equal(await page.locator('#agent-prompt').inputValue(), '不要丢掉助手输入');
+    assert.equal(await page.locator('#feedback').inputValue(), '不要丢掉观影反馈');
+    state.rejectConfirm = false;
+    // Even a non-standard 409 on a confirmed retry must retain everything again.
+    state.conflict = true; state.conflictCode = 'OTHER_CONFLICT';
+    await page.locator('#save').click();
+    await page.waitForFunction(() => document.getElementById('notice').textContent.includes('这次没有覆盖'));
+    assert.equal(patches().length, 2); assert.equal(state.project.revision, 9);
+    assert.equal(await page.locator('#title').inputValue(), '作者留在第七版的标题');
+    assert.equal(await page.getByLabel('开始（秒）', { exact: true }).inputValue(), '0.31');
+    assert.equal(await page.locator('#recording-player').getAttribute('src'), originalSrc);
+    state.project.credits.director = '服务器上的导演'; state.project.revision = 10;
+    await page.locator('#save').click();
+    await page.waitForFunction(() => document.getElementById('save-state').textContent === '已保存');
+    assert.deepEqual(patches().at(-1).body, { expectedRevision: 10, patch: { title: '作者留在第七版的标题' } });
+    assert.equal(state.project.revision, 11); assert.equal(state.project.story, '服务器的新故事');
+    assert.equal(state.project.credits.director, '服务器上的导演');
+    assert.deepEqual(state.project.edits, [{ id: 'approved-cut' }]);
+    assert.equal(await page.getByLabel('开始（秒）', { exact: true }).inputValue(), '0.31');
+    assert.equal(await page.getByLabel('额外说了什么').inputValue(), '额外的一句话');
+    assert.deepEqual(state.errors, []);
+  } finally { await context.close(); }
+});
+
+test('mock conflict: marker-only draft keeps old recording until explicit marker disposal', async () => {
+  const { page, context, state } = await setup(browser);
+  try {
+    await page.locator('#new-project').click(); await page.locator('#editor').waitFor({ state: 'visible' });
+    state.project.recordingAssetId = 'recording';
+    state.project.assets.push({ id: 'recording', kind: 'audio', mime: 'audio/wav', metadata: { duration: 4 } });
+    state.project.scenes.push({ id: 'scene-one', imageAssetId: null, action: '', dialogue: [{ id: 'line-one', characterId: 'hero', text: '你好', mode: 'normal' }], transition: 'cut', timeLabel: '' });
+    await page.locator('.project-card').click();
+    state.review.proposals = [{ id: 'stale-markers', currentSeconds: 2, targetSeconds: .5, sourceRange: { start: .5, end: 1.2 }, warnings: [] }];
+    await page.getByRole('button', { name: '确认剪短', exact: true }).waitFor();
+    await page.locator('#manual-markers summary').click();
+    await page.getByLabel('开始（秒）', { exact: true }).fill('0.42');
+    const originalSrc = await page.locator('#recording-player').getAttribute('src');
+    state.project.assets.push({ id: 'recording-new', kind: 'audio', mime: 'audio/wav', metadata: { duration: 4 } });
+    state.project.recordingAssetId = 'recording-new'; state.reviewConflict = true;
+    await page.getByRole('button', { name: '确认剪短', exact: true }).click();
+    await page.waitForFunction(() => document.getElementById('notice').textContent.includes('确认卡已过期'));
+    assert.equal(await page.locator('#recording-player').getAttribute('src'), originalSrc);
+    assert.equal(await page.getByLabel('开始（秒）', { exact: true }).inputValue(), '0.42');
+    assert.equal(await page.locator('#save').isDisabled(), false, 'marker-only conflict has an explicit recovery action');
+    // Polls may refresh cards but must not replace these old recording inputs.
+    state.review.agent.messages = [{ text: '冲突后继续保留旧标记' }];
+    await page.getByText('冲突后继续保留旧标记', { exact: true }).waitFor();
+    assert.equal(await page.locator('#recording-player').getAttribute('src'), originalSrc);
+    state.confirmAnswers = [true, false];
+    await page.locator('#save').click();
+    await page.waitForFunction(() => document.getElementById('notice').textContent.includes('旧时间标记和旧录音已保留'));
+    assert.equal(await page.getByLabel('开始（秒）', { exact: true }).inputValue(), '0.42');
+    assert.equal(await page.locator('#recording-player').getAttribute('src'), originalSrc);
+    assert.equal(state.requests.filter(r => r.method === 'PATCH').length, 0);
+    await page.locator('#title').fill('保留的草稿标题');
+    state.confirmAnswers = [true, true];
+    await page.locator('#save').click();
+    await page.waitForFunction(() => document.getElementById('save-state').textContent === '已保存');
+    assert.equal(state.project.title, '保留的草稿标题');
+    assert.equal(await page.locator('#recording-player').getAttribute('src'), '/paper-director/api/projects/project-one/assets/recording-new');
+    assert.equal(await page.getByLabel('开始（秒）', { exact: true }).inputValue(), '');
+    assert.match(state.dialogs.at(-1), /明确放下旧时间标记/);
+    assert.deepEqual(state.errors, []);
+  } finally { await context.close(); }
+});
+
+test('mock conflict: recorded blob survives association 409 and cancelled retry without another upload', async () => {
+  const { page, context, state } = await setup(browser, true);
+  try {
+    await page.locator('#new-project').click(); await page.locator('#editor').waitFor({ state: 'visible' });
+    await page.locator('#start-recording').click();
+    await page.locator('#stop-recording').waitFor({ state: 'visible' });
+    await page.waitForFunction(() => window.syntheticAudioContext?.currentTime > .4);
+    state.conflict = true;
+    await page.locator('#stop-recording').click();
+    await page.waitForFunction(() => !document.getElementById('retry-recording').hidden && !document.getElementById('retry-recording').disabled && document.getElementById('notice').textContent.includes('这次没有覆盖'));
+    const src = await page.locator('#recording-player').getAttribute('src');
+    assert.match(src, /^blob:/); assert.equal(state.project.recordingAssetId, null);
+    assert.match(await page.locator('#save-state').innerText(), /还没保存/);
+    const uploads = () => state.requests.filter(r => r.endpoint.endsWith('/assets') && r.method === 'POST');
+    assert.equal(uploads().length, 1);
+    state.rejectConfirm = true;
+    await page.locator('#retry-recording').click();
+    await page.waitForFunction(() => document.getElementById('notice').textContent.includes('已取消保存'));
+    assert.equal(await page.locator('#recording-player').getAttribute('src'), src);
+    assert.equal(uploads().length, 1); assert.equal(state.project.recordingAssetId, null);
+    state.rejectConfirm = false;
+    const revision = state.project.revision;
+    await page.locator('#retry-recording').click();
+    await page.waitForFunction(() => document.getElementById('retry-recording').hidden && !document.getElementById('audio-file').disabled);
+    assert.equal(uploads().length, 1, 'retry associates the already uploaded immutable recording, not a second copy');
+    assert.deepEqual(state.requests.filter(r => r.method === 'PATCH').at(-1).body, { expectedRevision: revision, patch: { recordingAssetId: 'asset-1' } });
+    assert.equal(state.project.recordingAssetId, 'asset-1');
+    assert.equal(state.project.title, '另一处保存的新版本');
+    assert.deepEqual(state.errors, []);
+  } finally { await context.close(); }
+});
+
+test('mock conflict: selected synthetic audio is retained when the upload itself returns 409', async () => {
+  const { page, context, state } = await setup(browser);
+  try {
+    await page.locator('#new-project').click(); await page.locator('#editor').waitFor({ state: 'visible' });
+    // Keep the local base stale through the input event without any production server.
+    await page.route('**/api/projects/project-one/assets', async route => {
+      state.project.revision++;
+      await page.unroute('**/api/projects/project-one/assets');
+      await route.fallback();
+    });
+    await page.locator('#audio-file').setInputFiles({ name: 'synthetic-conflict.wav', mimeType: 'audio/wav', buffer: wav() });
+    await page.waitForFunction(() => !document.getElementById('retry-recording').hidden && !document.getElementById('retry-recording').disabled && document.getElementById('notice').textContent.includes('这次没有覆盖'));
+    const src = await page.locator('#recording-player').getAttribute('src');
+    assert.match(src, /^blob:/); assert.equal(state.project.recordingAssetId, null);
+    state.rejectConfirm = true;
+    await page.locator('#retry-recording').click();
+    await page.waitForFunction(() => document.getElementById('notice').textContent.includes('已取消保存'));
+    assert.equal(await page.locator('#recording-player').getAttribute('src'), src);
+    assert.equal(state.requests.filter(r => r.endpoint.endsWith('/assets') && r.method === 'POST').length, 1);
+    state.rejectConfirm = false;
+    await page.locator('#retry-recording').click();
+    await page.waitForFunction(() => document.getElementById('retry-recording').hidden && !document.getElementById('audio-file').disabled);
+    const uploads = state.requests.filter(r => r.endpoint.endsWith('/assets') && r.method === 'POST');
+    assert.equal(uploads.length, 2); assert.equal(uploads[0].bytes, uploads[1].bytes);
+    assert.equal(state.project.recordingAssetId, 'asset-1');
+    assert.deepEqual(state.errors, []);
+  } finally { await context.close(); }
 });
 
 test.after(async () => { await browser.close(); });

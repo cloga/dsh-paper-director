@@ -324,7 +324,7 @@ export async function handleRequest(core, req, res) {
       data = await core.dispatch('job.list', { projectId: identifier(query.get('projectId')) })
     } else {
       const job = new RegExp(`^${ROOT}/api/jobs/([^/]+)(/cancel)?$`).exec(path)
-      const project = new RegExp(`^${ROOT}/api/projects/([^/]+)(?:/(history|restore|assets|align|render|narration|edits|agent)(?:/([^/]+))?)?$`).exec(path)
+      const project = new RegExp(`^${ROOT}/api/projects/([^/]+)(?:/(history|restore|assets|align|render|narration|edits|agent|review|reviews)(?:/([^/]+))?)?$`).exec(path)
       if (job) {
         const jobId = identifier(job[1]); queryFields(query)
         method(req, res, job[2] ? ['POST'] : ['GET', 'HEAD'])
@@ -334,7 +334,7 @@ export async function handleRequest(core, req, res) {
       } else if (project) {
         const projectId = identifier(project[1]), action = project[2], assetId = project[3]
         queryFields(query)
-        if (assetId && action !== 'assets') reject('NOT_FOUND', 'Route not found.', 404)
+        if ((assetId && !['assets', 'reviews'].includes(action)) || (action === 'reviews' && !assetId)) reject('NOT_FOUND', 'Route not found.', 404)
         if (!action) {
           method(req, res, ['GET', 'HEAD', 'PATCH'])
           if (req.method === 'PATCH') {
@@ -342,6 +342,16 @@ export async function handleRequest(core, req, res) {
             revision(body.expectedRevision); author(body.patch)
             data = await core.dispatch('project.update', { projectId, ...body })
           } else { noBody(req); data = await core.dispatch('project.get', { projectId }) }
+        } else if (action === 'review') {
+          method(req, res, ['GET', 'HEAD']); noBody(req)
+          // Human studio API only; never pass arbitrary session IDs or dispatch a model tool.
+          data = await core.review(projectId)
+        } else if (action === 'reviews') {
+          identifier(assetId); method(req, res, ['POST'])
+          const body = await jsonBody(req, ['expectedRevision', 'decision'])
+          revision(body.expectedRevision)
+          if (!['apply', 'dismiss'].includes(body.decision)) reject('INVALID_DECISION', 'Choose apply or dismiss.')
+          data = await core.decideReview(projectId, assetId, body)
         } else if (action === 'history') {
           method(req, res, ['GET', 'HEAD']); noBody(req)
           data = await core.dispatch('project.history', { projectId })

@@ -1,110 +1,59 @@
-# Implementation status / continuation checkpoint
+# v0.1.0 实现与验收记录
 
-## Goal and repository
+项目：纸上小导演 / `dsh-paper-director`。源码 https://github.com/cloga/dsh-paper-director ，跟踪 Issue #1 / PR #2。此文记录实现与本地验收，实际发布状态以GitHub PR/Release为准。
 
-- Product: 纸上小导演 / `dsh-paper-director`.
-- Fixed workflow: child’s idea → ordered photographs → dialogue/action notes per image → ONE complete recording → agent enrichment → review/edit/export. No mandatory per-scene recording.
-- Repository: https://github.com/cloga/dsh-paper-director
-- Tracking issue: https://github.com/cloga/dsh-paper-director/issues/1
-- Branch: `feature/issue-1-paper-director-mvp`; discovered default branch `main`.
-- Round 1 checkpoint `7e944c1` is published on the feature branch. This document now records round 2. **Overall goal remains ACTIVE; not a final release.**
-- No family photos, real child recordings, private films, credentials or machine-user paths in source. Fixtures are anonymous generated geometry/tones; data/artifacts/dependencies ignored.
+## 固定创作流程
 
-## Implemented through round 2
+孩子构思 → 有序照片 → 每图台词/动作 → **一次完整录音** → Agent丰富制作 → 观看和反馈。不强制逐幕录音，不让Agent擅自改写作者故事。
 
-### Application core and real HTTP
+## 已完成
 
-- `src/core/model.js`, `store.js`, `timeline.js`: stable IDs, author-controlled content, SQLite revisions/CAS/restore, project-scoped immutable assets, protected pause proposals/ripple edits, inserted magic/time/action scenes, shared authoritative timeline.
-- `src/core/service.js` is now implemented (it was missing at round-1 checkpoint): full public dispatch facade, scope validation, trusted Session bindings, readiness, binary imports with probe, durable bounded queue, alignment/render/narration jobs, cancellation, restoration and stale-result handling.
-- `src/http.js`: real project/assets/align/render/narration/edits/jobs/agent routes and static app. Auth remains `index.js` → `connection.requestRejection()` for EVERY route. Additional strict Origin/method/MIME/body/query/schema/path checks; Range/HEAD support; no private path/config DTO fields.
-- Upload budget is acquired **before reading request bodies**: at most 2 per Core, 1 per project, each reserves maxAssetBytes even without Content-Length. Core independently caps direct imports at 2.
-- SQLite runtime lease prevents a second live owner of the same dataDir from interrupting active jobs. On a real restart, queued/running jobs become interrupted, never silently reissued.
-- Queue slots reserved before async admission; per-project job cap and request-key dedupe are transactional. Session-bound tools cannot select another project; an empty/extra-field scope is rejected.
-- Successful alignment/render/narration result and project mutation commit in ONE SQLite transaction via `finishJobInMutation`. Cancellation before commit makes no project mutation; cancellation after commit cannot label the completed job cancelled.
-- All job initialization lies inside error handling; fixed safe diagnostics, sanitized progress/warnings, terminal states. Temp job outputs removed after settlement. Generated files are size-checked and read bounded before asset import. Historical asset quota uses ALL persisted assets, not the restored revision’s current array.
+- 独立媒体内核与正式DSH插件、专用同源Web工作室、侧栏入口和受限Agent preset。
+- SQLite持久项目/版本/可信会话绑定、不可变素材、版本恢复、CAS与租约保护。配额按所有历史素材计算，不随恢复旧版本重置。
+- 真实HTTP导入/媒体探测、整段MediaRecorder、人工时标及可选本地Whisper/Vosk适配。所有路径经DSH鉴权，再做Origin/大小/类型/参数检查；媒体支持Range。
+- 原始录音保留，统一采样时钟，静音/停顿修改作用于同一时间轴；字幕、图片、过场和音效同步移动。
+- 漫画文字/名牌、思考/短句气泡、硬切/魔法/时间卡、中文片头片尾；静态帧复用、动态帧重绘、H.264/AAC与正确色彩范围。
+- 默认原创合成音效（CC0声音数据）；Azure文字旁白默认关闭，有限额和不确定结果防重发。
+- 任务串行、取消、超时、输出软限额、临时文件清理；项目和成功任务状态同事务提交，取消不能产生“已改项目却显示取消”的假状态。
+- 对齐/旁白完成后通知对应Studio Agent继续；不自动创建/恢复冷会话，成功渲染不触发循环。通知先认领并去重。
+- 页面仅显示绑定Studio会话的有效助手文字，排除reasoning/tool/plugin/replaced历史；idle不表示影片完成。
+- 试听原段、确认剪短、保留原样、过期提案拒绝。未确认声音不能由模型自行批准删除。
+- 草稿/时间标记/未保存录音在409后保留，明确重试确认才写入最新版本；不自动覆盖或重录。
+- `paper_locate`使用所看影片保存的实际时间索引与原输入版本；过期渲染不冒充当前影片。
 
-### Media runtime, sound, recording clocks
+## 修复的关键问题
 
-- `src/core/worker.js`: fixed Python `-I` entry, no shell/credential environment, serial semaphore including health/import calls, bounded tasks/timeouts/result/progress, trusted test-only spawn DI.
-- Output monitor checks only owned movie/frame/result files every 100ms, default media 100MiB/result8MiB. TERM→2s KILL→bounded fail-closed if no acknowledgement. This is a **soft resource cap**, not an OS sandbox/disk quota; native unkillable behavior was stub-tested, not claimed physically impossible.
-- Independent Python: safe probe/full bounded validation; supplied-segment alignment; optional local Whisper/Vosk (no auto-download/cloud voice upload); Pillow paper/comic frames; shared frame/video painter; H.264/AAC limited-range BT.709.
-- `maxDuration` overlays are now truly limited and faded; reused sound prefixes decode once and release. Actual cue images only, LRU4 output-sized rasters, thumbnail before full-size copies. Single composed-frame reuse for static video states; dynamic magic/fade repaint.
-- Chinese titles/outros show director AND voice credits and “完 / 谢谢观看”; last frame fades black without shortening configured outro. English projects retain English labels/font requirements.
-- Browser MediaRecorder exposed a real intermittent Opus timestamp/sample mismatch under full test load. Fixed probe’s authoritative audio-only duration to the decoded-sample clock (same order used by alignment/mixer); preserve container/timestamp duration metadata for diagnostics. Tests encode an Opus timestamp gap and AAC padding explicitly. No real decoded audio samples are dropped to match container metadata.
-- Built-in original synthesized magic/time effects in `src/core/sounds.js`; generated sound data CC0-1.0. Explicit imported effects override them; `style.soundEffects:false` disables SFX. No Internet sound downloads needed.
-- Preview actually scales down while using the same painter/timeline; full export uses project size. Renderer clipping/padding/fade warnings now propagate as fixed safe DTO diagnostics.
+- 原始格式不能靠扩展名；MediaRecorder Opus/AAC时间标签可与解码采样长度不同。现在以解码采样顺序为音轨时钟并保留差异诊断，不丢真实解码样本。
+- 脚本与ASR文本必须分开；有空白不代表没有声音。人工标记/ASR候选之间的删除都要明确确认。
+- 素材限额必须覆盖历史版本，上传限额必须在读取请求体前预留，生成文件不能先全量读入再检查大小。
+- Azure远端请求成功但本地保存失败也可能已收费；所有不确定后果都不能盲目重试。
+- 未保存草稿在“批准修改→再保存409”路径不能被服务器旧值覆盖。
+- 空通知drain微任务窗口必须重扫pending，且不能在存储错误时热循环。
+- 插件不能假设SDK根React就是浏览器React；必须使用宿主shared seed。
 
-### Narration, tools and DSH
+## 实际验收
 
-- Azure text-only adapter implemented in `src/core/tts.js`: adult opt-in, fixed validated regional Microsoft host, no redirects, escaped SSML, 500-char requests, PCM24k mono verification, no POST retry.
-- Core reserves a persistent 5000-char/day safety budget before a request. Remote-attempt stage persists; after a POST, any ambiguous transport OR local persistence/cancellation failure becomes `TTS_UNCERTAIN`, blocking duplicate charges. Definite auth/rate-limit refusals remain distinct. Completed narration blobs can be relinked after a restore without paying again. This budget does NOT cover normal DSH model calls.
-- `index.js` Host Service, restricted `src/tools.js`, tiny React ModuleLoader sidebar entry, bundle and preset are implemented. Agent starter fixes preset `paper-director`, mounts and binds BEFORE followup; no privileged fallback or model-exposed starter.
-- Formal Core API range contracts aligned: pauses .25–3 seconds, 500-char narration, reserved character IDs rejected, 2048 dialogue maximum, raw audio metadata max600s vs derived videos max900s; FLAC supported consistently.
-- Preset installer / real tarball checker / CI and install documentation implemented. `files` now explicitly whitelists Python SOURCE files: prior broad `python` rule incorrectly packed pycache despite gitignore; this is fixed.
+- 完整Node套件：120项，118通过、0失败、2明确跳过（独立opt-in安装项，以及本Windows不允许的普通文件symlink）；安装项另行显式执行4/4通过。
+- UI套件：9/9通过，含确认后保存冲突、拒绝/接受、未保存时间标记、录音blob关联冲突。
+- Python套件：36/36通过，含编解码、音效前缀限制、图片缓存、字体、淡黑、AAC/Opus时钟。
+- 真实HTTP/浏览器：匿名PNG与音调导入、原生MediaRecorder WebM、明确人工时标、实际MP4播放、Range、提案试听与确认→受控Agent回调继续→新版影片。没有Playwright API mocks；认证fixture和模型回调仍与生产DSH/真实模型区分。
+- 实际DSH SDK原生Session/surface及消息结构、Cordis生命周期、tools schema测试通过；只提取可显示text叶字段，测试禁止序列化整个内部对象。
+- 实际打包安装：npm tarball→临时DSH_HOME/Profile→真实CLI/pnpm离线安装→正式 `healProfilesModuleFallback`→原生Loader Host/tools/core加载→项目创建/卸载/SQLite重开。未写当前GUI、部署或用户preset。
+- 普通tarball/安装器/文件白名单检查通过；不包含原家庭图片/录音/视频、凭据、依赖目录、缓存或测试产物。
 
-### Studio / evidence
+## 兼容性
 
-- Child Web studio implemented (story/characters/photo-dialogue/action/whole-recording/recording retry/manual markers/jobs/movie/feedback/history). UI field updates use changed fields only; user strings use textContent/value. No public/CDN dependency.
-- Honest privacy notice: raw audio remains local, but story/dialogue/transcription text goes to the adult-configured DSH model after choosing the Agent (which may be cloud). A restricted Agent is NOT a child-account/OS/browser sandbox; same DSH login retains host permissions. Initial version requires adult-supervised single-family/local use.
-- `scripts/demo.mjs` + `demo-media.mjs`: genuine Node Core→Python import/align/render/edit/re-render demo. Generated tones with explicitly provided marker text, not ASR inference. Latest run produced 7.8s→6.6s films, removed1.2s; artifacts in ignored `.test-output/demo`.
+DSH0.1.2-rc.1、Cordis4.0.2、Schemastery3.18.2。生产依赖闭包/磁盘shell的React18.3.1与SDK根开发React19.2.8不同；仅共享createElement的Client在两者上分别验证，可选peer范围>=18.3.1 <20。没有混React实例或降级SDK。
 
-## Verification actually completed
+Cordis4.0.2的干净registry安装曾ETARGET。源码开发用显式本地SDK链接；正式Profile使用DSH本身的fallback机制。具体安装见 `install.md`，逐项证据见 `installation-evidence.md`。
 
-Latest complete round-2 run:
-- `npm test` with actual linked SDK: **98 tests, 97 passed, 0 failed, 1 explicit Windows file-symlink EPERM skip**. Includes real Cordis Host lifecycle, 19 HTTP contracts/budget tests, real Core pipeline, security regression tests, actual SDK schema/bundle parsing, installer/tarball and worker kill/output-limit tests.
-- Python `unittest discover -s tests/python -p 'test*.py'`: **36/36 passed** (original16 + audio resource11 + presentation7 + audio clock2).
-- `npm run check`: real package tarball **37 regular files**, resources/exports/ModuleLoader/privacy checks pass. Do not pin archive hash while sources change.
-- Real browser HTTP test **NO Playwright API route mocks**: actual PNG/WAV uploads and probe, explicit markers, real render, native MP4 playback, protected pause confirmation/edit/re-render, 206 Range, actual MediaRecorder oscillator recording→real WebM/Opus upload/probe/align/render. Actual browser CSP had zero errors. Fixture cookie auth, NOT real DSH cookie cryptography. Evidence `tests/ui/.artifacts/real-http/evidence.json`, screenshot `movie.png`.
-- `tests/dsh-live.test.mjs`: real installed Cordis mounts the actual Host class (not a stripped stub), real SQLite works, registered routes reject unauthenticated requests via delegated test connection, dispose unregisters service/routes and releases DB lease. Carrier/auth implementations are test doubles; no production DSH was changed.
-- UI mock journeys were previously 3/3; rerun after final UI changes. Generated MediaRecorder stream uses no microphone.
-- Root SDK direct dev installation: Node24.19, DSH0.1.2-rc.1, Cordis4.0.2, Schemastery3.18.2, React19.2.8. Cordis4.0.2 registry install returned ETARGET; explicit version-checked `scripts/link-sdk.mjs` links only ignored local node_modules, no downgrade/mirror.
-- CI now has Node22.19/24 contracts, Python/CJK anonymous media, and browser+realHTTP job using pinned Playwright1.63.0. CI remote execution is NOT yet observed; check after push.
+## 明确限制
 
-## NEXT — finish the Agent product loop before final release
+- 没有把合成音调/人工时标当真实ASR质量或真人童声听审。实际模型推理/认证由部署者配置并验收。
+- 网络隐私：音频处理本地，但选择Agent后文本会进入配置的模型（可能云端）；Azure只发送批准的文字。
+- 仅成人监督的本机/单家庭预览版，DSH登录不是儿童独立账号，受限Agent不是OS沙箱或公网多用户权限系统。
+- 输入草稿/未保存录音在当前页面保护；刷新/关闭不能恢复尚未上传的内存数据，会先提示。
+- 输出监测是软资源限额，强制终止极端OS故障只做可控测试，不保证杀死任何拒绝终止的系统进程。
+- 无对白动作图默认展示时间；高级多轨、连续肢体AI动画、任意段内TTS编排和多人协作不在本版。
 
-### A. Asynchronous jobs must wake the correct Agent
-
-Current tools return custom Core jobs; UI polls them, but **there is no completion notification to the producing DSH Agent yet**. Without it, an Agent may stop after paper_align and never schedule render, or busy-poll and waste model calls.
-
-Implement Core job→trusted originating Session subscriptions before jobs can finish, then a Fiber-owned Host callback that wakes only the bound live Agent on relevant completion. Never let models supply Session IDs. Suggested tool-side scope extension: trusted `exec.agent.session.id`, validated against project binding; keep admin-fixed project tools separate from studio-created sessions. Dedupe (jobId,sessionId) notices. No automatic cold resume/create or more powerful preset. Avoid a render-success→render-again notification loop: message must describe kind/status and stop after completed export, or do not wake for successful render (UI can report it).
-
-Actual SDK facts (installed module paths below are relative to `node_modules/@deepseek-ai`):
-- `dsh-agent/lib/index.js:684–691`: `ctx.agents.get(sessionId)` returns live Agent|undefined, NOT handle. create/resume return handle.
-- `dsh-agent-loop/lib/index.js:395–403`: `agent.followup(message)` queues next turn and wakes driver. Construct via `createUserMessage({content:[{type:'text',text:boundedStatus}],source:{kind:'plugin',plugin:'dsh-paper-director'}})`.
-- Check binding before AND after awaits; only minimal jobId/kind/status in notification, no path/error or entire live objects.
-- `ctx.on` is Fiber-owned; custom Core listeners should return disposer and be owned by `ctx.effect`. No SDK `subscribeLifecycle` exists.
-
-### B. Show Agent replies and explicit edit confirmations in the child page
-
-Current `/agent` POST returns only sessionId; page cannot show a later assistant clarification/failure if no media job appears. Add bounded read-only Agent status/reply endpoint and UI polling that does not overwrite dirty edits.
-
-SDK read contracts:
-- `agent.status` is ONLY idle|running (loop:385–393); idle is NOT movie completion.
-- `sessionPersistence.inspect(id,signal?)` in this exact SDK returns `{meta,inheritedEventCount,events}`; supports live/cold readonly view, may synthesize interrupted closures IN MEMORY. No `session.getSnapshot()` method.
-- Relevant events: `assistant/message` → `e.data.message`; keep role==='assistant' AND m.source.kind==='model'; take ONLY content blocks type==='text', bounded e.g.8k chars. Do not expose reasoning/chunk/tool/result/user/plugin prompt. Read leaf seq/id/text/interrupted only; NEVER serialize view/events/Message/Session wholesale.
-- To exclude replaced/compacted historical surfaces, use live `session.surface.nodes` + eventAt, or official `foldSurface(view.events).nodes` then leaf selection. `deriveMessages()` also returns shared internals, not dumpable.
-- `turn/end` e.data.reason.kind includes completed/aborted/blocked/error/max-tokens/interrupted. Read reason kind, not raw error payload. Waiting-human comes from Core pending proposals; movie complete from Core exports/jobs.
-- `agentPresets.resolve('paper-director')` and defaultModel.currentSelection are readonly health checks, BUT resolve can return preset.broken; check it. This proves configured only, not real mount/auth. Do not use standingKeyFor in health (it mounts).
-
-Do not expose ordinary administrator session history to the child UI. Only sessions newly created by the studio and bound by the Host should be readable in that UI; an admin-fixed tool binding is not blanket permission to publish that session’s previous conversation.
-
-All actual alignment methods (`provided_segments`, `local_whisper`, `local_vosk`) currently require explicit human confirmation for gap deletion because transcript gaps alone do not verify silence. HTTP supports `allowUnmatchedSpeech:true`, model tools always false. **There is no pending-proposal confirmation UI yet**: add persisted proposal/review metadata and a small playback+confirm interaction (or equivalent) so the Agent can request review without telling children to craft HTTP JSON.
-
-Add a compact rendered-time index or a scoped scene-at-time tool for natural feedback. UI movie time includes intro/insertions/edits, while project.alignment is source-recording time; do not make the model guess. Use the actual viewed export revision/asset identity. Silent action scenes currently insert2s; consider optional hold/scene markers for adjustments, but do not expand into a full multitrack editor.
-
-### C. Remaining installation and release validation
-
-- Actual tarball+installer+DSH bundle resolver are verified; **not yet a real profile pnpm install with packed entry loaded under the production module resolver**, nor a full restricted model turn. Verify in isolated/temp profile only, do not change current GUI/DSH/shipped presets. Parent actual Cordis test uses explicit SDK links; do not pretend that proves fresh profile dependency resolution.
-- New profiles have autoInstallPeers:false/nodeLinker:hoisted. Existing profiles may differ. Current SDK dev deps unpublished; do not downgrade. Check install instructions against actual CLI.
-- Real ASR inference/accuracy untested without administrator-provided weights; only adapter/readiness and provided-marker path verified. If validating real ASR, use public existing model weights and newly synthesized anonymous speech, not private family audio; no unauthorized cloud call.
-- General scene-bound Azure narration is not yet linked; style.narrationAssetId currently means INTRO narration only. A simple sceneNarrations association/time-card duration extension is possible. Do not promise time-card speech if not implemented.
-- `makeAgentStarter.ready` preflight not wired yet, although Core supports a ready callback. Update it to avoid UI claiming configured when preset missing/broken.
-- Re-run full tests, actual HTTP browser flow, package and install/preset checks; review source/privacy before final publication. Open PR fixing #1 after complete scoped verification, observe CI, address review, merge via normal workflow and verify exact remote SHA. Default branch currently still initialization; feature branch holds development checkpoints.
-- Final README must clearly state supported environments/limits and supervision scope; remove WIP only after complete loop is actually verified.
-
-## Boundaries and operations
-
-- No current DSH server/profile, shipped preset or deployment source modified. Test servers are ephemeral loopback fixtures and are always closed; they do not replace the existing GUI.
-- Public sources have no developer-machine absolute paths or private media. Do not stage .venv/node_modules/.deps/.artifacts/.test-output/SQLite/media outputs. Exact npm files whitelist is necessary; a broad python directory whitelist previously leaked pycache.
-- All child agents completed assigned tasks; all their background jobs were collected. Main owns continuation integration and GitHub delivery.
-- Credential instructions remain user-level: only designated GH_TOKEN file, process-local official HTTPS headers, verify cloga before writes, TLS on/redirects off, no default-branch push. Delivery helper scripts are outside this repo.
+首次发布验收流程仍需观察最终提交的GitHub CI与PR状态；不要把本地测试结果自动等同于已合并或已发布。

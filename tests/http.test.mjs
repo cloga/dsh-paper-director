@@ -29,6 +29,8 @@ async function fixture(t, overrides = {}) {
     },
     async asset(projectId, assetId) { calls.push({ operation: 'asset', projectId, assetId }); return { path: media, mime: 'video/mp4', bytes: 10 } },
     async startAgent(args) { calls.push({ operation: 'startAgent', args }); return { sessionId: 'session-test' } },
+    async review(projectId) { calls.push({ operation: 'review', projectId }); return { projectId, revision: 2, agent: { liveStatus: 'idle', lastTurnReason: 'completed', messages: [{ text: '请确认这段停顿。' }] }, proposals: [{ id: 'proposal-one' }] } },
+    async decideReview(projectId, proposalId, body) { calls.push({ operation: 'decideReview', projectId, proposalId, body }); return { id: projectId, revision: body.expectedRevision + (body.decision === 'apply' ? 1 : 0) } },
     ...overrides,
   }
   const server = http.createServer((req, res) => { handleRequest(core, req, res).catch(() => res.destroy()) })
@@ -109,6 +111,34 @@ test('alignment/render/narration/edits/jobs map to Core without model scope or h
   assert.deepEqual(calls.at(-1), { operation: 'job.cancel', args: { jobId: 'job1' }, scope: undefined })
   assert.deepEqual(ok(await request(`${PROJECT}/agent`, { method: 'POST', body: { expectedRevision: 2, prompt: '请开始制作' } })), { sessionId: 'session-test' })
   assert.deepEqual(calls.at(-1), { operation: 'startAgent', args: { projectId: 'story', expectedRevision: 2, prompt: '请开始制作' } })
+})
+
+test('human review routes call dedicated Core methods and preserve strict identity/body/Origin fences', async t => {
+  const { request, calls, core } = await fixture(t)
+  const review = ok(await request(`${PROJECT}/review`))
+  assert.equal(review.agent.messages[0].text, '请确认这段停顿。')
+  assert.deepEqual(calls.pop(), { operation: 'review', projectId: 'story' })
+  for (const decision of ['apply', 'dismiss']) {
+    const body = { expectedRevision: 2, decision }
+    ok(await request(`${PROJECT}/reviews/proposal-one`, { method: 'POST', body }))
+    assert.deepEqual(calls.pop(), { operation: 'decideReview', projectId: 'story', proposalId: 'proposal-one', body })
+  }
+  for (const body of [
+    { expectedRevision: 2, decision: 'yes' }, { expectedRevision: 2 }, { decision: 'apply' },
+    { expectedRevision: '2', decision: 'apply' }, { expectedRevision: 2, decision: 'apply', sessionId: 'admin-session' },
+    { expectedRevision: 2, decision: 'apply', allowUnmatchedSpeech: true },
+  ]) denied(await request(`${PROJECT}/reviews/proposal-one`, { method: 'POST', body }), 400)
+  for (const suffix of ['review?sessionId=admin-session', 'reviews/proposal.one']) denied(await request(`${PROJECT}/${suffix}`, { method: suffix.includes('?') ? 'GET' : 'POST', ...(suffix.includes('?') ? {} : { body: { expectedRevision: 2, decision: 'apply' } }) }), 400)
+  denied(await request(`${PROJECT}/review`, { raw: '{}', headers: { 'content-length': '2' } }), 400)
+  denied(await request(`${PROJECT}/review`, { method: 'POST', body: {} }), 405)
+  denied(await request(`${PROJECT}/reviews/proposal-one`), 405)
+  denied(await request(`${PROJECT}/reviews`), 404)
+  denied(await request(`${PROJECT}/review/extra`), 404)
+  denied(await request(`${PROJECT}/review`, { headers: { origin: 'https://evil.invalid' } }), 403)
+  denied(await request(`${PROJECT}/reviews/proposal-one`, { method: 'POST', body: { expectedRevision: 2, decision: 'apply' }, headers: { origin: 'https://evil.invalid' } }), 403)
+  assert.equal(calls.length, 0, 'invalid requests do not reach Core')
+  core.decideReview = async () => { throw new ProjectError('REVISION_CONFLICT', 'Review is stale.', 409) }
+  denied(await request(`${PROJECT}/reviews/proposal-one`, { method: 'POST', body: { expectedRevision: 2, decision: 'apply' } }), 409, 'REVISION_CONFLICT')
 })
 
 test('static allowlist, redirect, HEAD, private ETag revalidation and security headers', async t => {

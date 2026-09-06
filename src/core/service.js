@@ -9,10 +9,11 @@ import { ProjectError, fail, id, object, text, clone } from './model.js'
 import { validateAlignment, compileTimeline, proposePauseEdit, applyPauseEdit } from './timeline.js'
 import { synthesizeNarration, narrationReady } from './tts.js'
 import { addBuiltInEffects } from './sounds.js'
+import { StudioAgentLoop } from './agent-loop.js'
 
 const TERMINAL=new Set(['succeeded','failed','cancelled','interrupted'])
 const STAGES=new Set(['queued','starting','probe','align','render','frame','encode','mix','complete','working'])
-const jobDto=j=>({id:j.id,projectId:j.projectId,kind:j.kind,revision:j.revision,status:j.status,progress:j.progress,stage:j.stage,createdAt:j.createdAt,updatedAt:j.updatedAt,result:j.result,error:j.error})
+const jobDto=j=>{let result=j.result;if(result&&typeof result==='object'){const {timelineIndex:_index,...visible}=result;result=visible}return {id:j.id,projectId:j.projectId,kind:j.kind,revision:j.revision,status:j.status,progress:j.progress,stage:j.stage,createdAt:j.createdAt,updatedAt:j.updatedAt,result,error:j.error}}
 const digest=value=>createHash('sha256').update(JSON.stringify(value)).digest('hex')
 function expected(value){if(!Number.isSafeInteger(value)||value<1)fail('EXPECTED_REVISION_REQUIRED','请先刷新作品版本。',409);return value}
 const cancelled=signal=>{if(signal?.aborted)fail('CANCELLED','任务已取消。')}
@@ -26,7 +27,7 @@ export class PaperDirectorCore {
     this.tts=dependencies.tts||synthesizeNarration
     this.queue=[];this.active=new Map();this.controllers=new Map();this.closed=false;this.initialized=false;this.closePromise=null
     this.agentStarter=undefined;this.agentStarting=new Set();this.healthCache=null;this.reserved=0
-    this.importTasks=new Set();this.enqueueTasks=new Set();this.volatileFailures=new Map()
+    this.importTasks=new Set();this.enqueueTasks=new Set();this.volatileFailures=new Map();this.agentLoop=new StudioAgentLoop(this)
   }
   async init(){
     if(this.initialized)return this
@@ -35,14 +36,24 @@ export class PaperDirectorCore {
     const jobsDir=path.join(this.store.root,'jobs');await fs.mkdir(jobsDir,{recursive:true,mode:0o700})
     // The store lease excludes any other live owner. These are derivative/temp files only.
     for(const entry of await fs.readdir(jobsDir,{withFileTypes:true}))if(/^(?:health-|import-)?[a-f0-9-]{36}$/.test(entry.name))await fs.rm(path.join(jobsDir,entry.name),{recursive:true,force:true}).catch(()=>{})
-    this.initialized=true;return this
+    this.agentLoop.init();this.initialized=true;return this
   }
   checkOpen(){if(!this.initialized||this.closed)fail('SERVICE_UNAVAILABLE','工作室暂时不可用。',503)}
   setAgentStarter(fn){if(fn!==undefined&&typeof fn!=='function')throw new TypeError('Agent starter must be a function');this.agentStarter=fn}
   async agentReady(){try{return !!this.agentStarter&&(typeof this.agentStarter.ready!=='function'||await this.agentStarter.ready())}catch{return false}}
   async bindSession(sessionId,projectId){this.checkOpen();id(sessionId,'session id');await this.store.get(projectId);const existing=this.store.db.prepare('SELECT project_id FROM agent_bindings WHERE session_id=?').get(sessionId);if(existing&&existing.project_id!==projectId)fail('BINDING_EXISTS','会话已经绑定另一部作品。',409);this.store.db.prepare('INSERT OR IGNORE INTO agent_bindings(session_id,project_id) VALUES(?,?)').run(sessionId,projectId)}
   async bindingForSession(sessionId){this.checkOpen();id(sessionId,'session id');return this.store.db.prepare('SELECT project_id FROM agent_bindings WHERE session_id=?').get(sessionId)?.project_id}
-  validateScope(scope){if(scope===undefined)return;object(scope,'scope');if(Object.keys(scope).length!==1||typeof scope.projectId!=='string')fail('PROJECT_FORBIDDEN','缺少可信作品绑定。',403);id(scope.projectId)}
+  isStudioSession(sessionId,projectId){this.checkOpen();return this.agentLoop.bound(sessionId,projectId)}
+  onAgentNotice(callback){return this.agentLoop.onNotice(callback)}
+  setAgentStatusReader(callback){this.agentLoop.setReader(callback)}
+  async review(projectId){this.checkOpen();return this.agentLoop.review(id(projectId))}
+  async decideReview(projectId,proposalId,input){this.checkOpen();return this.agentLoop.decide(projectId,proposalId,input)}
+  validateScope(scope){
+    if(scope===undefined)return;object(scope,'scope')
+    if(Object.keys(scope).some(k=>!['projectId','sessionId'].includes(k))||typeof scope.projectId!=='string')fail('PROJECT_FORBIDDEN','缺少可信作品绑定。',403)
+    id(scope.projectId)
+    if(scope.sessionId!==undefined){id(scope.sessionId);if(!this.agentLoop.bound(scope.sessionId,scope.projectId))fail('PROJECT_FORBIDDEN','会话没有绑定此作品。',403)}
+  }
   projectId(args,scope){if(scope){if(args.projectId!==undefined&&args.projectId!==scope.projectId)fail('PROJECT_FORBIDDEN','只能操作当前绑定的作品。',403);return scope.projectId}return id(args.projectId,'project id')}
   async asset(projectId,assetId){this.checkOpen();return this.store.asset(projectId,assetId)}
   publicJob(job){return jobDto(this.volatileFailures.has(job.id)?{...job,status:'failed',stage:'failed',error:this.volatileFailures.get(job.id)}:job)}
@@ -104,14 +115,15 @@ export class PaperDirectorCore {
     if(operation==='project.restore')return this.store.restore(projectId,expected(args.expectedRevision),args.revision)
     if(operation==='project.update')return this.store.update(projectId,expected(args.expectedRevision),args.patch)
     if(operation==='job.list')return (await this.store.jobs(projectId)).map(j=>this.publicJob(j))
+    if(operation==='movie.locate')return this.agentLoop.locate(projectId,args)
     const project=await this.store.get(projectId)
     if(project.revision!==expected(args.expectedRevision))fail('REVISION_CONFLICT','作品已更新，请刷新。',409)
     if(operation==='timeline.propose'||operation==='timeline.apply'){
       const op=object(args.operation,'edit operation');if(op.type!=='shorten_pause')fail('INVALID_EDIT','不支持这种修改。')
-      const proposal=proposePauseEdit(project,{afterDialogueId:op.afterDialogueId,beforeDialogueId:op.beforeDialogueId,targetSeconds:op.targetSeconds})
+      const proposal=this.agentLoop.saveProposal(project,proposePauseEdit(project,{afterDialogueId:op.afterDialogueId,beforeDialogueId:op.beforeDialogueId,targetSeconds:op.targetSeconds}),scope?.sessionId)
       if(operation==='timeline.propose')return proposal
       if(!proposal.cuts.length)return project
-      return this.store.mutate(projectId,args.expectedRevision,p=>applyPauseEdit(p,proposal,{allowUnmatchedSpeech:scope?false:args.allowUnmatchedSpeech===true}))
+      return this.store.mutate(projectId,args.expectedRevision,p=>{const edited=applyPauseEdit(p,proposal,{allowUnmatchedSpeech:scope?false:args.allowUnmatchedSpeech===true});this.store.db.prepare("UPDATE paper_proposals SET status='applied' WHERE id=?").run(proposal.id);return edited})
     }
     if(operation==='recording.align'){
       if(!project.recordingAssetId||!project.scenes.length)fail('NOT_READY','先准备照片、台词和一整段录音。')
@@ -120,17 +132,18 @@ export class PaperDirectorCore {
       if(scope&&engine==='segments')fail('MANUAL_ALIGNMENT_ONLY','人工标记只能从工作室确认。',403)
       if(engine==='segments'&&(!Array.isArray(args.segments)||args.segments.length>5000))fail('INVALID_ALIGNMENT','请提供明确的人工时间标记。')
       if(engine!=='segments'&&!this.config.asrModelPath)fail('MODEL_NOT_READY','本地语音模型未配置，可先使用人工时间标记。',503)
-      return this.enqueue(project,'align',{engine,...(engine==='segments'?{segments:args.segments}:{})})
+      return this.enqueue(project,'align',{engine,...(engine==='segments'?{segments:args.segments}:{})},scope?.sessionId)
     }
-    if(operation==='movie.render'){const timeline=compileTimeline(project);if(timeline.duration>900)fail('PROJECT_TOO_LONG','第一版暂支持15分钟以内成片。');return this.enqueue(project,'render',{preview:args.preview===true})}
+    if(operation==='movie.render'){const timeline=compileTimeline(project);if(timeline.duration>900)fail('PROJECT_TOO_LONG','第一版暂支持15分钟以内成片。');return this.enqueue(project,'render',{preview:args.preview===true},scope?.sessionId)}
     if(operation==='narration.generate'){
       if(!narrationReady(this.config))fail('TTS_DISABLED','旁白需要家长配置并开启Azure语音服务。',503)
       const narration=text(args.text,500,'narration');if(!narration)fail('EMPTY_TEXT','旁白文字不能为空。')
       if(args.voiceProfile!==undefined&&args.voiceProfile!=='narrator')fail('INVALID_VOICE','只使用已配置的旁白声线。')
       const fingerprint=digest({text:narration,voice:'zh-CN-XiaoxiaoNeural',region:this.config.azureRegion})
       const past=await this.store.jobs(projectId)
-      const prior=past.find(j=>j.kind==='narration'&&j.input?.ttsFingerprint===fingerprint&&['queued','running','succeeded','interrupted'].includes(j.status))
+      let prior=past.find(j=>j.kind==='narration'&&j.input?.ttsFingerprint===fingerprint&&['queued','running','succeeded','interrupted'].includes(j.status))
       if(prior){
+        prior=this.agentLoop.subscribe(prior,scope?.sessionId)
         if(prior.status==='succeeded'&&prior.result?.assetId&&!project.assets.some(a=>a.id===prior.result.assetId)){
           const {path:_internal,...asset}=await this.store.asset(projectId,prior.result.assetId)
           const restored=await this.store.mutate(projectId,args.expectedRevision,p=>{p.assets.push(asset);return p})
@@ -139,17 +152,18 @@ export class PaperDirectorCore {
         return this.publicJob(prior)
       }
       if(past.some(j=>j.kind==='narration'&&j.input?.ttsFingerprint===fingerprint&&j.error?.code==='TTS_UNCERTAIN'))fail('TTS_UNCERTAIN','上次请求结果不确定，为避免重复费用请让家长检查Azure用量。',409)
-      return this.enqueue(project,'narration',{text:narration,ttsFingerprint:fingerprint})
+      return this.enqueue(project,'narration',{text:narration,ttsFingerprint:fingerprint},scope?.sessionId)
     }
     fail('UNKNOWN_OPERATION','不支持的制作操作。',404)
   }
-  enqueue(project,kind,input){
-    this.checkOpen();if(this.queue.length+this.active.size+this.reserved>=30)fail('QUEUE_FULL','制作队列已满，请稍后再试。',429)
+  enqueue(project,kind,input,sessionId){
+    this.checkOpen();if(sessionId&&!this.agentLoop.bound(sessionId,project.id))fail('PROJECT_FORBIDDEN','制作会话不属于这部作品。',403);if(this.queue.length+this.active.size+this.reserved>=30)fail('QUEUE_FULL','制作队列已满，请稍后再试。',429)
     this.reserved++
     const task=(async()=>{
       const fingerprint=digest({kind,revision:project.revision,input})
-      this.checkOpen();const job=await this.store.jobCreate(project.id,kind,project.revision,{...clone(input),fingerprint})
-      if(job.reused)return this.publicJob(job)
+      this.checkOpen();const created=await this.store.jobCreate(project.id,kind,project.revision,{...clone(input),fingerprint})
+      const job=this.agentLoop.subscribe(created,sessionId)
+      if(created.reused)return this.publicJob(job)
       if(this.closed)return this.publicJob(await this.store.jobUpdate(job.id,{status:'cancelled',stage:'cancelled',error:{code:'SERVICE_CLOSED',message:'工作室已停止。'}}))
       this.controllers.set(job.id,new AbortController());this.queue.push(job.id);this.pump();return this.publicJob(job)
     })().finally(()=>{this.reserved--})
@@ -191,9 +205,10 @@ export class PaperDirectorCore {
         const current=await this.store.get(project.id),stale=current.revision!==job.revision
         const warnings=publicWarnings([...timeline.warnings,...(Array.isArray(rendered.warnings)?rendered.warnings:[])])
         await this.store.addAsset(project.id,current.revision,{name:job.input.preview?'预览电影.mp4':'我的电影.mp4',kind:'video',mime:'video/mp4',buffer,metadata:{duration:timeline.duration,width:timeline.width,height:timeline.height,codec:'h264',audioStreams:1,videoStreams:1,sampleRate:48000,channels:2}},{signal,onProject:(p,asset)=>{
-          const entry={jobId,assetId:asset.id,inputRevision:job.revision,preview:job.input.preview,createdAt:new Date().toISOString(),warnings}
+          const entry={jobId,assetId:asset.id,inputRevision:job.revision,outputRevision:p.revision+1,preview:job.input.preview,createdAt:new Date().toISOString(),warnings}
           if(!stale)p.exports.push(entry)
-          result={...entry,applied:!stale,revision:p.revision+1};this.store.finishJobInMutation(jobId,result);return p
+          const timelineIndex={duration:timeline.duration,introSeconds:timeline.introSeconds,outroSeconds:timeline.outroSeconds,cues:timeline.cues.map(c=>({sceneId:c.sceneId,start:c.start,end:c.end,kind:c.kind})),subtitles:timeline.subtitles.map(s=>({dialogueId:s.dialogueId,sceneId:s.sceneId,start:s.start,end:s.end}))}
+          result={...entry,applied:!stale,revision:p.revision+1,timelineIndex};this.store.finishJobInMutation(jobId,result);return p
         }});committed=true
       }else if(job.kind==='narration'){
         cancelled(signal);const day=new Date().toISOString().slice(0,10)
@@ -215,18 +230,21 @@ export class PaperDirectorCore {
         const uncertain=error?.code==='TTS_UNCERTAIN',failure=publicError(error)
         try{await this.store.jobUpdate(jobId,{status:signal?.aborted&&!uncertain?'cancelled':'failed',stage:uncertain?'uncertain':signal?.aborted?'cancelled':'failed',error:failure})}catch{this.volatileFailures.set(jobId,failure)}
       }
-    }finally{await fs.rm(directory,{recursive:true,force:true}).catch(()=>{})}
+    }finally{
+      await fs.rm(directory,{recursive:true,force:true}).catch(()=>{})
+      if(!this.closed)try{this.agentLoop.settled(this.store.jobRead(jobId))}catch{/* Failure facts stay in the durable job; notification must not undo them. */}
+    }
   }
   async cancel(stale){
     const job=this.store.jobRead(stale.id)
     if(TERMINAL.has(job.status))return this.publicJob(job)
     this.controllers.get(job.id)?.abort();this.queue=this.queue.filter(id=>id!==job.id)
-    if(!this.active.has(job.id)){this.controllers.delete(job.id);return this.publicJob(await this.store.jobUpdate(job.id,{status:'cancelled',stage:'cancelled',error:{code:'CANCELLED',message:'任务已取消。'}}))}
+    if(!this.active.has(job.id)){this.controllers.delete(job.id);const done=await this.store.jobUpdate(job.id,{status:'cancelled',stage:'cancelled',error:{code:'CANCELLED',message:'任务已取消。'}});this.agentLoop.settled(done);return this.publicJob(done)}
     return this.publicJob(job)
   }
   async close(){
     if(this.closePromise)return this.closePromise
-    this.closed=true;this.agentStarter=undefined
+    this.closed=true;this.agentStarter=undefined;this.agentLoop.close()
     this.closePromise=(async()=>{
       for(const controller of this.controllers.values())controller.abort()
       await Promise.allSettled([...this.enqueueTasks])

@@ -73,11 +73,12 @@ test('partial core init still has registered cleanup', async () => {
 })
 test('human Agent bridge fixes preset, mounts it, binds before followup', async () => {
   const { makeAgentStarter } = await loadHost(); const events = []
-  const core = { dispatch: async (op, args, scope) => { assert.equal(op, 'project.get'); assert.equal(scope.projectId, 'p1') }, bindSession: async (sid, pid) => { assert.equal(pid, 'p1'); events.push('bind') } }
+  const core = { dispatch: async (op, args, scope) => { assert.equal(op, 'project.get'); assert.equal(scope.projectId, 'p1') }, bindSession: async (sid, pid) => { assert.equal(pid, 'p1'); events.push('bind') }, isStudioSession: () => true }
+  let live
   const ctx = {
     agentDefaultModel: { currentSelection: () => ({ provider: 'test', model: 'local' }) },
-    agentPresets: { async mount(agentCtx, id) { assert.equal(id, 'paper-director'); events.push('mount') } },
-    agents: { async create(options) { assert.equal(options.meta.agentPreset, 'paper-director'); await options.setup({}); return { agent: { session: { id: options.sessionId }, followup(message) { assert.deepEqual(events, ['mount', 'bind']); assert.equal(message.source.kind, 'plugin'); events.push('followup') } }, async dispose() {} } } },
+    agentPresets: { resolve: async () => ({ id: 'paper-director' }), async mount(agentCtx, id) { assert.equal(id, 'paper-director'); events.push('mount') } },
+    agents: { get: () => live, async create(options) { assert.equal(options.meta.agentPreset, 'paper-director'); await options.setup({}); live = { session: { id: options.sessionId }, followup(message) { assert.deepEqual(events, ['mount', 'bind']); assert.equal(message.source.kind, 'plugin'); events.push('followup') } }; return { agent: live, async dispose() {} } } },
   }
   const result = await makeAgentStarter(core, ctx)({ projectId: 'p1', prompt: '请制作预览' })
   assert.equal(result.sessionId, 'session-test-id'); assert.deepEqual(events, ['mount', 'bind', 'followup'])
@@ -85,7 +86,7 @@ test('human Agent bridge fixes preset, mounts it, binds before followup', async 
 test('Agent bridge disposes failed delivery and never sends before binding succeeds', async () => {
   const { makeAgentStarter } = await loadHost(); let disposed = false; let sent = false
   const core = { dispatch: async () => {}, bindSession: async () => { throw new Error('binding failed') } }
-  const ctx = { agentDefaultModel: { currentSelection: () => ({}) }, agentPresets: {}, agents: { async create(options) { return { agent: { session: { id: options.sessionId }, followup() { sent = true } }, async dispose() { disposed = true } } } } }
+  const ctx = { agentDefaultModel: { currentSelection: () => ({ provider: 'test', model: 'local' }) }, agentPresets: { resolve: async () => ({ id: 'paper-director' }) }, agents: { async create(options) { return { agent: { session: { id: options.sessionId }, followup() { sent = true } }, async dispose() { disposed = true } } } } }
   await assert.rejects(makeAgentStarter(core, ctx)({ projectId: 'p1', prompt: 'preview' }), /binding failed/)
   assert.equal(sent, false); assert.equal(disposed, true)
 })
@@ -98,22 +99,30 @@ async function toolsFixture(config = {}) {
 }
 test('two sessions cannot select each other’s projects and inherited tools are masked', async () => {
   const f = await toolsFixture()
-  assert.deepEqual(f.restrictions, [{ allow: [] }]); assert.equal(f.tools.size, 8)
+  assert.deepEqual(f.restrictions, [{ allow: [] }]); assert.equal(f.tools.size, 9)
   await assert.rejects(f.run('paper_project', { projectId: 'p2' }, 's1'), /Unknown media/)
   await assert.rejects(f.run('paper_project', { projectId: 'p1' }, 's2'), /Unknown media/)
   await f.run('paper_project', {}, 's1')
   await f.run('paper_project', {}, 's2')
-  assert.deepEqual(f.calls.map((call) => call.scope), [{ projectId: 'p1' }, { projectId: 'p2' }])
+  assert.deepEqual(f.calls.map((call) => call.scope), [{ projectId: 'p1', sessionId: 's1' }, { projectId: 'p2', sessionId: 's2' }])
   assert.deepEqual(f.calls.map((call) => call.args), [{}, {}])
   await assert.rejects(f.run('paper_project', {}, 'unknown'), /No trusted project binding/)
   assert.equal(f.calls.length, 2)
 })
 test('administrator binding is not a tool parameter', async () => {
   const f = await toolsFixture({ projectId: 'admin-project' }); await f.run('paper_project')
-  assert.equal(f.calls[0].scope.projectId, 'admin-project')
+  assert.deepEqual(f.calls[0].scope, { projectId: 'admin-project' })
   for (const tool of f.tools.values()) {
     for (const forbidden of ['projectId', 'path', 'command', 'azureKeyEnv', 'allowUnmatchedSpeech']) assert.equal(Object.hasOwn(tool.parameters, forbidden), false)
   }
+})
+test('movie location uses viewed asset/time with trusted studio scope only', async () => {
+  const f = await toolsFixture()
+  await f.run('paper_locate', { assetId: 'movie1', time: 4.25 })
+  assert.deepEqual(f.calls[0], { op: 'movie.locate', args: { assetId: 'movie1', time: 4.25 }, scope: { projectId: 'p1', sessionId: 's1' } })
+  for (const time of [-1, NaN, Infinity]) await assert.rejects(f.run('paper_locate', { assetId: 'movie1', time }), /Invalid movie/)
+  await assert.rejects(f.run('paper_locate', { assetId: '../private', time: 1 }), /Invalid movie/)
+  await assert.rejects(f.run('paper_locate', { assetId: 'movie1', time: 1, sessionId: 'other' }), /Unknown media/)
 })
 test('pause tools cannot authorize unmatched speech or accept forged cut ranges', async () => {
   const f = await toolsFixture()

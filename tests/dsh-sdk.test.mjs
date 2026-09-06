@@ -16,9 +16,12 @@ test('actual DSH defineTool accepts all restricted tool schemas', { skip }, asyn
   const config = Config({})
   assert.equal(config.projectId, '')
   apply({ tools: { restrict: (filter) => assert.deepEqual(filter, { allow: [] }), register: (tool) => registered.set(tool.name, tool) }, paperDirector: { bindingForSession: () => 'p1', dispatch: async (op, args, scope) => { calls.push({ op, args, scope }); return { id: 'p1', revision: 0 } } } }, config)
-  assert.equal(registered.size, 8)
+  assert.equal(registered.size, 9)
   const exec = { agent: { session: { id: 's1' } } }
   await registered.get('paper_project').execute({}, exec)
+  assert.deepEqual(calls.at(-1).scope, { projectId: 'p1', sessionId: 's1' })
+  await registered.get('paper_locate').execute({ assetId: 'movie1', time: 4.2 }, exec)
+  assert.deepEqual(calls.at(-1), { op: 'movie.locate', args: { assetId: 'movie1', time: 4.2 }, scope: { projectId: 'p1', sessionId: 's1' } })
   await assert.rejects(registered.get('paper_project').execute({ projectId: 'p2' }, exec))
   await assert.rejects(registered.get('paper_render').execute({ expectedRevision: 1.2 }, exec))
   await assert.rejects(registered.get('paper_jobs').execute({ action: 'shell' }, exec))

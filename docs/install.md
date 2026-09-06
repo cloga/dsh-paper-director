@@ -2,7 +2,7 @@
 
 ## 状态与兼容性
 
-目标是 **DSH 0.1.2-rc.1 / Cordis 4.0.2 / Schemastery 3.18.2 / React 19.2.8**。这些是开发环境实际安装的 SDK 版本，不是“npm 一定能下载”的承诺。开发时官方 npm registry 对 `@deepseek-ai/cordis@4.0.2` 返回 **ETARGET**；不要降到 4.0.1、改镜像或把这个错误当普通网络重试。尚未验证其他 DSH 版本。
+目标是 **DSH 0.1.2-rc.1 / Cordis 4.0.2 / Schemastery 3.18.2**。侧栏只使用宿主共享 React 的 createElement，已分别验证生产闭包/磁盘shell的 **18.3.1** 与SDK根开发版本 **19.2.8**，可选peer范围为 `>=18.3.1 <20`；不是把两份React混合使用。开发时 npm registry 对 `@deepseek-ai/cordis@4.0.2` 返回 **ETARGET**；不要降到4.0.1或改镜像。正式DSH会通过其 `healProfilesModuleFallback` 提供已安装SDK依赖，这与源码开发的显式link不同。尚未验证其他DSH版本。
 
 本项目是 plain JavaScript，不需要 TypeScript/JSX 编译。仓库已包含小型 `lib/client.js`，只从 DSH ModuleLoader 获取 `react`；不 bundle DSH shell、不启动第二个 Web 服务器，也不修改正在运行的 GUI。包安装与用户 preset 安装是两个分别授权的步骤。
 
@@ -10,7 +10,7 @@
 
 ### 本轮实测证据
 
-在本机已经存在的上述版本 SDK 上，`tests/package.test.mjs`、`tests/preset-install.test.mjs`、`tests/dsh-sdk.test.mjs` 合跑：**24 项，23 通过，0 失败，1 明确跳过**。跳过的是 Windows 普通文件 symlink 创建权限（EPERM）；目录 junction、悬空目标、并发拒绝均实际通过。真实 npm tarball 含 35 个普通文件，Python cache 已排除；tarball 内 installer 到临时 root 的复制和正式 SDK bundle/四个 exports 解析通过。没有 pnpm Profile 安装、Host 激活、preset 真实挂载或浏览器/模型回合；CI 尚需 GitHub 实际执行。
+已用真实npm tarball、隔离DSH_HOME/Profile、真实 `dsh plugin add ... --offline --ignore-scripts`、正式fallback与原生Loader完成Host激活、Core项目创建、卸载及SQLite重开；未修改当前生产Profile或GUI。插件factory分别使用真实React18.3.1/19.2.8测试。细节、复现命令和限定见 [实际安装证据](installation-evidence.md)。用户preset复制、路径/junction/并发保护也有独立测试；Windows普通文件symlink测试因OS权限明确跳过，而非冒充通过。媒体/浏览器/模型证据须分开：已验证真实HTTP和MP4播放；不把匿名音调+人工时间标记当作真实ASR识别率或付费模型推理证据。
 
 ## 1. 在源码目录离线检查 npm 产物
 
@@ -105,7 +105,7 @@ try {
 # Review and remove only $testHome when no longer needed.
 ```
 
-此流程可能联网、产生依赖/store；本轮不把“临时解析测试”当成已执行上述命令。不要在当前运行的 Profile 上尝试。干净 registry 安装、runtime peers 和完整启动仍是发行验收项；ETARGET 必须明确保留为未通过门槛。
+普通安装可能联网并产生依赖/store；本项目已用额外 `--offline` 的本地tarball在隔离Profile执行真实CLI/pnpm安装、正式依赖fallback和Host/Core加载，详见安装证据。不要把隔离验收当作已经修改你的运行Profile。干净registry下载该SDK仍受ETARGET限制；正式安装依赖已有的受支持DSH SDK，不能通过降级掩盖。
 
 ## 3. 显式安装独立用户 preset
 
@@ -150,7 +150,27 @@ python -m unittest discover -s tests/python -p 'test_*.py' -v
 python tests/python/synthetic_demo.py --output-dir tests/python/.artifacts/demo
 ```
 
-成人通过 Profile 自己的 patch 覆盖 `paper-director` 行的 `pythonPath` 为虚拟环境解释器；具体配置不得写入公共仓库。中文依赖真实 CJK 字体；Ubuntu CI 安装 `fonts-noto-cjk`。确认 health 的 `cjkReady`，而不仅是 `fontReady`。输出测试使用几何图和合成音调，不含儿童照片或录音；提供的台词不是 ASR 识别，不能由技术测试声称“已听过”。
+成人通过 Profile 自己的 `cordis.patch.yml` 覆盖 `paper-director` 行。当前patch按id替换整个config，因此应保留需要的所有字段，例如（路径必须换成自己的，不能原样复制）：
+
+```yaml
+- id: paper-director
+  config:
+    dataDir: !!js dshHomePath('paper-director')
+    pythonPath: '/absolute/path/to/.venv/bin/python'
+    # Windows示例形式：'C:\path\to\.venv\Scripts\python.exe'
+    fontPath: ''
+    asrModelPath: ''
+    asrEngine: whisper
+    allowCloudTts: false
+    azureRegion: ''
+    azureKeyEnv: AZURE_SPEECH_KEY
+```
+
+这是Host Profile的用户覆盖，不是Agent preset，更不能修改部署自带的composition。Windows路径使用单引号。需要自动对齐时，先在该虚拟环境安装 `requirements-asr.txt`，由成人准备本地Whisper/Vosk模型目录，再填写 `asrModelPath` 和对应引擎；默认不下载模型，也不把录音传到云端。没有模型仍可使用页面的人工时间标记。
+
+如需Azure片头旁白，由成人在启动DSH的进程环境配置上述变量，再填写真实区域并明确开启 `allowCloudTts`。不要把密钥写入项目JSON、对话或公共仓库。
+
+中文依赖真实CJK字体；Ubuntu CI安装 `fonts-noto-cjk`。页面工作室检查会提示缺失组件。测试使用几何图和合成音调，不含儿童照片或录音；提供的台词不是ASR识别，不能由技术测试声称“已听过”。
 
 `.github/workflows/verify.yml` 将 Node 无依赖合同/真实 tarball 与 Python 匿名媒体分开：不运行 `npm install`、不偷偷降 Cordis；SDK schema/实际 bundle resolver 没有显式 SDK_ROOT 时报告 SKIP。Python job 安装字体和 Python 依赖，运行实际编码/解码、worker 测试、匿名 CLI demo，并用 `PAPER_DIRECTOR_TEST_PYTHON` 打开 Node 的真实 Python 测试。CI 不验证生产模型、Azure、实际 ASR 推理、真实 DSH 会话或人工试听，也不上传产物作为私有媒体。
 

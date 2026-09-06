@@ -4,7 +4,9 @@ const $ = id => document.getElementById(id);
 const ACTIVE = new Set(['queued', 'running']);
 const state = { project: null, draft: null, projects: [], dirty: new Set(), busy: false, health: null,
   jobs: [], timer: null, generation: 0, markers: new Map(), extras: [], recorder: null, stream: null,
-  recordTimer: null, recordingStarted: 0, objectUrl: null, pendingRecording: null, seenJobs: new Set() };
+  recordTimer: null, recordingStarted: 0, objectUrl: null, pendingRecording: null, pendingRecordingAssetId: null, seenJobs: new Set(),
+  review: null, reviewRequest: 0, markerDirty: false, snippet: null, snippetTimer: null, watched: null,
+  conflictPending: false, conflictBaseline: null };
 const clone = value => structuredClone(value);
 const uid = () => crypto.randomUUID();
 const safeId = value => typeof value === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(value);
@@ -51,7 +53,7 @@ function notice(message, tone = '') {
   $('notice').hidden = false;
 }
 const ERRORS = {
-  REVISION_CONFLICT: '故事本在另一处更新了。我们已取回新版本，没有覆盖它；请看看最新内容后再修改。',
+  REVISION_CONFLICT: '故事本有了新版本。这次没有覆盖任何内容，你未保存的想法、时间标记和录音仍在原处。请点“保存”或录音的“重试保存”，确认后才会保存到新版本；取消会继续保留输入。',
   EXPECTED_REVISION_REQUIRED: '版本信息过期了，请刷新故事本后再试。',
   AGENT_NOT_CONFIGURED: '导演助手还没有接好，请请大人配置工作室。你的故事和录音都还在。',
   AGENT_UNAVAILABLE: '导演助手暂时不能开工。请请大人检查配置，不会假装电影已经制作。',
@@ -93,6 +95,14 @@ async function api(path, { method = 'GET', body, headers = {} } = {}) {
   return envelope.data;
 }
 const projectPath = suffix => `/projects/${encodeURIComponent(state.project.id)}${suffix || ''}`;
+function publicText(value, max = 1000) {
+  if (typeof value !== 'string') return '';
+  if (/[A-Za-z]:[\\/]|\\\\|\/(?:home|Users|tmp|var|etc|root|private|opt|mnt)\/|(?:api[_-]?key|authorization|password|secret|token)\s*[:=]|\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+/i.test(value)) return '这条消息含有工作室内部信息，已隐藏。请请大人检查。'.slice(0, max);
+  return value.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '').slice(0, max);
+}
+function canRefreshProject() {
+  return !state.conflictPending && !state.dirty.size && !state.markerDirty && !state.busy && !state.recorder && !state.pendingRecording && !state.snippet;
+}
 function mark(field) {
   state.dirty.add(field);
   $('save-state').textContent = '有新的想法，还没保存';
@@ -114,7 +124,7 @@ function controls() {
   $('stop-recording').disabled = state.busy;
   $('retry-recording').disabled = state.busy;
   for (const cancel of document.querySelectorAll('[data-cancel-job]')) cancel.disabled = state.busy;
-  $('save').disabled = locked || !state.dirty.size;
+  $('save').disabled = locked || (!state.dirty.size && !state.conflictPending);
   const hasProject = !!state.project;
   const hasAudio = !!state.project?.recordingAssetId;
   const hasScenes = !!state.project?.scenes.length;
@@ -128,30 +138,67 @@ function controls() {
   $('submit-markers').disabled = locked || !hasAudio || inProgress;
   $('start-recording').disabled = locked || !navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined';
   $('add-character').disabled = locked || (state.draft?.characters.length || 0) >= 8;
+  for (const control of document.querySelectorAll('[data-review-action]')) {
+    control.disabled = locked || (control.dataset.reviewAction === 'listen' && (!hasAudio || control.dataset.playable !== 'true' || state.review?.revision !== state.project?.revision));
+  }
 }
 async function task(action) {
   if (state.busy) return;
   state.busy = true; controls();
   try { await action(); }
   catch (error) {
-    if (error?.code === 'REVISION_CONFLICT' && state.project) {
-      try { const current = await api(projectPath()); acceptProject(current, true); await listProjects(); }
-      catch { /* Original conflict remains the primary error. */ }
-    }
-    notice(friendly(error), 'error');
+    if (error?.code === 'SAVE_CANCELLED') return;
+    if ((error?.status === 409 || error?.code === 'REVISION_CONFLICT') && state.project) {
+      await rememberConflict();
+      notice(ERRORS.REVISION_CONFLICT, 'warning');
+    } else notice(friendly(error), 'error');
   } finally { state.busy = false; controls(); }
 }
 function acceptProject(project, reset = true) {
   if (!project || !safeId(project.id)) throw { code: 'INVALID_PROJECT' };
   state.project = project;
-  if (reset) { state.draft = clone(project); state.dirty.clear(); }
+  if (reset) {
+    state.draft = clone(project); state.dirty.clear();
+    state.conflictPending = false; state.conflictBaseline = null;
+  }
   drawProject();
 }
-async function saveDraft() {
-  if (!state.dirty.size) return;
+async function rememberConflict() {
+  // A server snapshot is only a candidate for an explicit retry, never the author draft.
+  state.conflictPending = true; state.conflictBaseline = null;
+  try { state.conflictBaseline = await api(projectPath()); }
+  catch { /* Keep the old inputs even when fetching the conflict baseline fails. */ }
+}
+async function saveDraft(explicitRetry = false) {
+  let baseline = state.project, discardMarkers = false;
+  if (state.conflictPending) {
+    if (!explicitRetry) {
+      notice(ERRORS.REVISION_CONFLICT, 'warning');
+      throw { code: 'SAVE_CANCELLED' };
+    }
+    // Re-read on every explicit attempt: the previous conflict snapshot may itself be stale.
+    baseline = await api(projectPath()); state.conflictBaseline = baseline;
+    if (!confirm(`故事本已有第 ${baseline.revision} 版。要把你尚未保存的想法保存到这一版吗？只有你改过的部分会写入，其他内容使用新版本（可能包括录音）。点击“取消”会保留当前输入，不保存也不切换版本。`)) {
+      notice('已取消保存。未保存的想法、时间标记和录音仍在原处。', 'warning');
+      throw { code: 'SAVE_CANCELLED' };
+    }
+    const markerSourceChanged = baseline.recordingAssetId !== state.project.recordingAssetId ||
+      JSON.stringify(baseline.scenes) !== JSON.stringify(state.project.scenes) ||
+      JSON.stringify(baseline.characters) !== JSON.stringify(state.project.characters);
+    if (state.markerDirty && markerSourceChanged) {
+      if (!confirm('新版本的录音或台词已经变化，旧时间标记不能直接套用。是否明确放下旧时间标记，保存想法后切换到新版本，再重新听录音标记？点击“取消”会保留旧输入和旧录音，不做任何保存。')) {
+        notice('旧时间标记和旧录音已保留。请先核对并记下这些标记；确认放下旧标记后才能切换新版本。', 'warning');
+        throw { code: 'SAVE_CANCELLED' };
+      }
+      discardMarkers = true;
+    }
+  }
+  if (!state.dirty.size && !state.conflictPending) return;
   const patch = {};
   for (const field of state.dirty) patch[field] = clone(state.draft[field]);
-  const updated = await api(projectPath(), { method: 'PATCH', body: { expectedRevision: state.project.revision, patch } });
+  const updated = state.dirty.size ? await api(projectPath(), { method: 'PATCH', body: { expectedRevision: baseline.revision, patch } }) : baseline;
+  // Do not discard markers until the write succeeds (another 409 may still occur).
+  if (discardMarkers) { state.markerDirty = false; state.markers.clear(); state.extras = []; }
   acceptProject(updated);
   await listProjects();
 }
@@ -167,11 +214,17 @@ async function listProjects() {
   }
   controls();
 }
-function stopPolling() { clearTimeout(state.timer); state.timer = null; state.generation += 1; }
+function stopPolling() {
+  clearTimeout(state.timer); state.timer = null; state.generation += 1; state.reviewRequest += 1;
+  stopSnippet(); state.review = null; state.markerDirty = false; state.watched = null;
+  $('agent-messages').replaceChildren(); $('review-cards').replaceChildren();
+}
 async function openProject(id) {
   if (state.recorder || state.pendingRecording) { notice('先结束并保存这段录音，再换故事本。刚才的录音还留在这个页面。', 'warning'); return; }
-  if (state.dirty.size && !confirm('还有没保存的想法。先留在这里保存吗？点击“取消”才会放下这些修改。')) state.dirty.clear();
-  else if (state.dirty.size) return;
+  if (state.dirty.size || state.markerDirty) {
+    if (confirm('还有没保存的想法或时间标记。先留在这里保存吗？点击“取消”才会放下这些修改并打开故事本。')) return;
+    state.dirty.clear();
+  }
   stopPolling();
   document.querySelectorAll('audio,video').forEach(media => media.pause());
   state.markers.clear(); state.extras = []; state.jobs = []; state.seenJobs.clear();
@@ -285,13 +338,24 @@ async function uploadPhotos(files) {
   }
   notice('照片放进故事本了。可以调整顺序，再写动作和台词。');
 }
-async function uploadRecording(file) {
-  await saveDraft();
-  const asset = await uploadAsset(file, 'audio');
-  state.draft.recordingAssetId = asset.id; mark('recordingAssetId'); await saveDraft();
-  state.markers.clear(); state.extras = []; drawMarkers();
+async function uploadRecording(file, explicitRetry = false) {
+  // File uploads need the same in-page recovery as a freshly captured recording.
+  if (!state.pendingRecording) {
+    state.pendingRecording = file;
+    if (state.objectUrl) URL.revokeObjectURL(state.objectUrl);
+    state.objectUrl = URL.createObjectURL(file); drawRecording();
+  }
+  await saveDraft(explicitRetry);
+  if (!state.pendingRecordingAssetId) {
+    const asset = await uploadAsset(file, 'audio');
+    state.pendingRecordingAssetId = asset.id;
+  }
+  if (state.project.recordingAssetId !== state.pendingRecordingAssetId) {
+    state.draft.recordingAssetId = state.pendingRecordingAssetId; mark('recordingAssetId'); await saveDraft();
+  }
+  state.markerDirty = false; state.markers.clear(); state.extras = []; drawMarkers();
   if (state.pendingRecording === file) {
-    state.pendingRecording = null;
+    state.pendingRecording = null; state.pendingRecordingAssetId = null;
     if (state.objectUrl) URL.revokeObjectURL(state.objectUrl);
     state.objectUrl = null; $('retry-recording').hidden = true; drawRecording();
   }
@@ -393,11 +457,11 @@ function markerTime(label, marker, key) {
   const group = node('label', label);
   const row = node('div', null, { class: 'marker-time' });
   const field = node('input', null, { type: 'number', min: '0', step: '0.01', value: marker[key] ?? '', 'aria-label': label });
-  field.addEventListener('input', () => { marker[key] = field.value === '' ? null : Number(field.value); });
+  field.addEventListener('input', () => { state.markerDirty = true; marker[key] = field.value === '' ? null : Number(field.value); });
   row.append(field, button('取当前时间', () => {
     const time = $('recording-player').currentTime;
     if (!Number.isFinite(time)) return;
-    marker[key] = Math.round(time * 100) / 100; field.value = marker[key];
+    state.markerDirty = true; marker[key] = Math.round(time * 100) / 100; field.value = marker[key];
   }, 'quiet', `${label}使用录音当前时间`)); group.append(row); return group;
 }
 function drawMarkers() {
@@ -419,8 +483,8 @@ function drawExtraMarkers() {
   const holder = $('extra-markers'); holder.replaceChildren();
   state.extras.forEach(extra => {
     const row = node('div', null, { class: 'marker-row extra' });
-    row.append(input('额外说了什么', extra.text, value => { extra.text = value; }, { maxlength: '1000', placeholder: '写下实际说的话' }), markerTime('额外话开始（秒）', extra, 'start'), markerTime('额外话结束（秒）', extra, 'end'),
-      button('×', () => { state.extras = state.extras.filter(item => item.id !== extra.id); drawExtraMarkers(); }, 'quiet', '移除额外标记'));
+    row.append(input('额外说了什么', extra.text, value => { state.markerDirty = true; extra.text = value; }, { maxlength: '1000', placeholder: '写下实际说的话' }), markerTime('额外话开始（秒）', extra, 'start'), markerTime('额外话结束（秒）', extra, 'end'),
+      button('×', () => { state.markerDirty = true; state.extras = state.extras.filter(item => item.id !== extra.id); drawExtraMarkers(); }, 'quiet', '移除额外标记'));
     holder.append(row);
   });
 }
@@ -446,6 +510,7 @@ async function submitMarkers() {
   const duration = $('recording-player').duration;
   if (Number.isFinite(duration) && segments.some(s => s.end > duration + .01)) { notice('有一句结束时间超过了整段录音，请再检查一下。', 'warning'); return; }
   const job = await api(projectPath('/align'), { method: 'POST', body: { expectedRevision: state.project.revision, engine: 'segments', segments } });
+  state.markerDirty = false;
   addJob(job); notice('已经提交人工标记。这里使用你提供的台词，不会把它说成自动识别。');
 }
 function addJob(job) {
@@ -466,20 +531,136 @@ async function makeMovie(preview) {
   notice(preview ? '正在直接制作预览。这不是助手对故事的自动修改。' : '正在制作正式电影，会保留当前故事版本。');
 }
 async function sendAgent(feedback = false) {
+  // Capture the displayed export BEFORE saving can redraw the movie player.
+  const watched = state.watched && { ...state.watched, currentTime: Number.isFinite($('movie-player').currentTime) ? $('movie-player').currentTime : null };
+  const viewing = watched ? `当前观看电影：assetId=${watched.assetId}；inputRevision=${watched.inputRevision}；currentTime=${watched.currentTime} 秒。请按这部电影的时间索引理解，不要猜当前故事的时间。` : '当前观看电影：assetId=null；inputRevision=null；currentTime=null（尚未观看电影，不能按秒定位）。';
   await saveDraft();
   const prompt = $(feedback ? 'feedback' : 'agent-prompt').value.trim();
   if (feedback && !prompt) { notice('先告诉助手你想改哪一点吧。', 'warning'); return; }
   const result = await api(projectPath('/agent'), { method: 'POST', body: { expectedRevision: state.project.revision,
-    prompt: prompt || '请尊重我的故事和逐图台词，用这一整段录音把照片丰富成纸艺电影。先检查准备情况，保留额外的话，说明不确定之处，再制作可预览的电影。' } });
+    prompt: feedback ? `${prompt}\n\n${viewing}` : prompt || '请尊重我的故事和逐图台词，用这一整段录音把照片丰富成纸艺电影。先检查准备情况，保留额外的话，说明不确定之处，再制作可预览的电影。' } });
   if (!safeId(result?.sessionId)) throw { code: 'AGENT_UNAVAILABLE' };
-  $('agent-status').textContent = '已交给导演助手。它还在工作，不代表电影已经完成；下面会显示实际制作任务和结果。';
+  $('agent-status').textContent = '已交给导演助手，正在查询真实工作状态。不代表电影已经完成；下面会显示实际制作任务和结果。';
   notice(feedback ? '修改想法已交给助手。旧电影和原素材都会保留。' : '助手收到你的故事了。让我们等它真正完成制作。');
   clearTimeout(state.timer); state.timer = setTimeout(() => pollJobs(state.generation), 900);
+}
+async function refreshReview(generation = state.generation) {
+  const projectId = state.project?.id;
+  if (!projectId || generation !== state.generation) return;
+  const request = ++state.reviewRequest;
+  try {
+    const review = await api(`/projects/${encodeURIComponent(projectId)}/review`);
+    if (generation !== state.generation || request !== state.reviewRequest || state.project?.id !== projectId) return;
+    state.review = review;
+    drawReview(); controls();
+  } catch {
+    if (generation === state.generation && request === state.reviewRequest) {
+      $('agent-status').textContent = '暂时连不上助手状态，不能判断助手是否仍在工作。制作任务另列在下方。';
+      $('review-cards').replaceChildren(node('p', '待确认修改暂时无法刷新，请稍后再试。'));
+    }
+  }
+}
+function drawReview() {
+  const agent = state.review?.agent;
+  const labels = { running: '正在整理你的电影', idle: '这一轮已停下，看看下面的回复', cold: '暂时没有运行，不会自行开始新任务' };
+  const reasons = { completed: '这一轮回复已结束。', aborted: '这一轮已取消。', blocked: '有问题需要确认。', error: '这一轮没能完成，请让大人检查设置。', 'max-tokens': '这次回复达到长度限制。', interrupted: '这一轮被中断了。' };
+  const status = labels[agent?.liveStatus] || '正在检查状态';
+  const pending = state.review?.proposals?.length ? '有剪辑建议等你试听确认。' : '';
+  $('agent-status').dataset.liveStatus = agent?.liveStatus || 'unknown';
+  $('agent-status').textContent = `导演助手：${status}。${reasons[agent?.lastTurnReason] || ''}${pending}电影做好后，会出现在下方播放器里。`;
+  const messages = $('agent-messages'); messages.replaceChildren();
+  let budget = 8000;
+  const recent = [];
+  for (const message of (Array.isArray(agent?.messages) ? agent.messages : []).slice(-10).reverse()) {
+    if (!budget || typeof message?.text !== 'string' || !message.text.trim()) continue;
+    const text = publicText(message.text, Math.min(2000, budget)); budget -= text.length;
+    recent.unshift({ text, interrupted: message.interrupted === true });
+  }
+  for (const message of recent) {
+    const text = message.text;
+    const reply = node('div', null, { class: 'agent-reply' });
+    reply.append(node('p', text));
+    if (message.interrupted === true) reply.append(node('small', '这条回复被中断，可能还没说完。'));
+    messages.append(reply);
+  }
+  if (!messages.children.length) messages.append(node('p', '暂时没有可见的助手回复。工具任务是否排队、进行或失败，请看下方实际制作任务；没有回复不代表完成。', { class: 'muted' }));
+  const cards = $('review-cards'); cards.replaceChildren();
+  for (const proposal of (Array.isArray(state.review?.proposals) ? state.review.proposals : []).slice(0, 20)) {
+    if (!safeId(proposal?.id)) continue;
+    const card = node('article', null, { class: 'review-card', 'data-proposal-id': proposal.id });
+    const seconds = value => Number.isFinite(value) ? `${value.toFixed(2)} 秒` : '未知';
+    card.append(node('h4', '这段停顿要剪短吗？'), node('p', `原停顿：${seconds(proposal.currentSeconds)} → 新停顿：${seconds(proposal.targetSeconds)}`), node('p', '试听只播放完整原始录音中的这一段，不是剪短后的效果。'));
+    const warnings = node('ul');
+    for (const warning of (Array.isArray(proposal.warnings) ? proposal.warnings : []).slice(0, 10)) {
+      const text = publicText(typeof warning === 'string' ? warning : warning?.message, 500);
+      if (text) warnings.append(node('li', text));
+    }
+    if (warnings.children.length) card.append(warnings);
+    const actions = node('div', null, { class: 'action-row' });
+    const listen = button('试听原段', () => playSnippet(proposal), 'secondary');
+    listen.dataset.reviewAction = 'listen'; listen.dataset.playable = String(validSourceRange(proposal.sourceRange));
+    const apply = button('确认剪短', () => task(() => decideReview(proposal, 'apply')), 'primary'); apply.dataset.reviewAction = 'apply';
+    const dismiss = button('保留原样', () => task(() => decideReview(proposal, 'dismiss')), 'quiet'); dismiss.dataset.reviewAction = 'dismiss';
+    actions.append(listen, apply, dismiss); card.append(actions); cards.append(card);
+  }
+}
+function validSourceRange(range) {
+  return Number.isFinite(range?.start) && Number.isFinite(range?.end) && range.start >= 0 && range.end > range.start && range.end <= 600;
+}
+function stopSnippet(pause = true) {
+  clearTimeout(state.snippetTimer); state.snippetTimer = null;
+  if (!state.snippet) return;
+  state.snippet = null;
+  if (pause) $('recording-player').pause();
+}
+function checkSnippet() {
+  const snippet = state.snippet;
+  if (!snippet) return;
+  const player = $('recording-player');
+  if (player.getAttribute('src') !== snippet.src || player.currentTime >= snippet.end || player.currentTime < snippet.start - .05 || player.ended) { stopSnippet(); return; }
+  clearTimeout(state.snippetTimer);
+  // timeupdate is coarse; the timer also bounds playback at the original segment end.
+  state.snippetTimer = setTimeout(checkSnippet, Math.min(100, Math.max(10, (snippet.end - player.currentTime) * 1000 / Math.max(.1, player.playbackRate))));
+}
+async function playSnippet(proposal) {
+  const range = proposal.sourceRange, player = $('recording-player');
+  if (!validSourceRange(range) || state.recorder || state.pendingRecording || !state.project.recordingAssetId || state.review?.revision !== state.project.revision) return;
+  const src = assetUrl(state.project.id, state.project.recordingAssetId);
+  if (player.getAttribute('src') !== src) return;
+  if (Number.isFinite(player.duration) && range.end > player.duration + .01) { notice('原录音区间超出了录音长度，暂时不能试听。', 'warning'); return; }
+  stopSnippet();
+  const snippet = { start: range.start, end: range.end, src }; state.snippet = snippet;
+  try {
+    player.currentTime = range.start;
+    await player.play();
+    if (state.snippet === snippet) checkSnippet();
+  } catch {
+    if (state.snippet === snippet) { stopSnippet(); notice('原段暂时无法播放。请等原录音加载好后再试。', 'warning'); }
+  }
+}
+async function decideReview(proposal, decision) {
+  const projectId = state.project.id, generation = state.generation, expectedRevision = state.review?.revision;
+  if (decision === 'apply' && !confirm('确认把这段停顿剪短吗？请先听原段并检查提醒；如果包含额外说的话，它们也可能被剪掉。原始录音仍会保留。')) return;
+  stopSnippet();
+  try {
+    const project = await api(`/projects/${encodeURIComponent(projectId)}/reviews/${encodeURIComponent(proposal.id)}`, { method: 'POST', body: { expectedRevision, decision } });
+    if (generation !== state.generation) return;
+    // Keep author inputs, selection, markers, and unsaved recording untouched. The
+    // next safe poll may load the new Project; dirty drafts keep their base revision.
+    if (!state.conflictPending && !state.dirty.size && !state.markerDirty && !state.recorder && !state.pendingRecording) acceptProject(project);
+    notice(decision === 'apply' ? '已确认剪短。原始录音保留；新电影还需要实际制作。未保存的想法仍留在原处。' : '已保留原样。未保存的想法仍留在原处。');
+  } catch (error) {
+    if (error?.status !== 409 && error?.code !== 'REVISION_CONFLICT') throw error;
+    await rememberConflict();
+    notice('这张确认卡已过期，没有应用修改。已刷新待确认卡片；你正在编辑的内容和录音没有被覆盖。请点“保存”并明确确认后再保存想法。', 'warning');
+  }
+  await refreshReview(generation);
 }
 const JOB_NAMES = { align: '对齐整段录音', render: '制作电影', narration: '制作旁白' };
 const JOB_STATES = { queued: '排队中', running: '进行中', succeeded: '完成', failed: '没有完成', cancelled: '已取消', interrupted: '被中断，请重新检查' };
 function drawJobs() {
   const holder = $('jobs'); holder.replaceChildren();
+  if (!state.jobs.length) holder.append(node('p', '目前没有制作工具任务。尚无电影结果时，不能把助手停下当作电影完成。', { class: 'muted' }));
   for (const job of state.jobs.slice(0, 8)) {
     const card = node('div', null, { class: 'job-card', 'data-job-id': job.id });
     const top = node('div', null, { class: 'job-top' });
@@ -502,17 +683,18 @@ async function pollJobs(generation) {
   if (!state.project || generation !== state.generation) return;
   const projectId = state.project.id;
   try {
-    const jobs = await api(`/jobs?projectId=${encodeURIComponent(projectId)}`);
+    const [jobs] = await Promise.all([api(`/jobs?projectId=${encodeURIComponent(projectId)}`), refreshReview(generation)]);
     if (generation !== state.generation || state.project.id !== projectId) return;
     state.jobs = jobs;
     const completed = jobs.filter(j => j.status === 'succeeded' && !state.seenJobs.has(j.id));
     jobs.filter(j => !ACTIVE.has(j.status) && j.status !== 'succeeded').forEach(j => state.seenJobs.add(j.id));
-    if (completed.length && !state.dirty.size && !state.busy && !state.recorder) {
+    const newerReview = state.review?.revision > state.project.revision;
+    if ((completed.length || newerReview) && canRefreshProject()) {
       const project = await api(`/projects/${encodeURIComponent(projectId)}`);
-      if (generation === state.generation && !state.dirty.size && !state.busy && !state.recorder && !state.pendingRecording && project.revision >= state.project.revision) {
+      if (generation === state.generation && canRefreshProject() && project.revision >= state.project.revision) {
         state.markers.clear(); acceptProject(project); completed.forEach(job => state.seenJobs.add(job.id)); await listProjects();
       }
-    } else if (completed.length && state.dirty.size) notice('制作任务有新结果。你还有没保存的想法，先保存或刷新故事本，再查看结果。', 'warning');
+    } else if ((completed.length || newerReview) && (state.dirty.size || state.markerDirty)) notice('制作任务或故事本有新结果。你的未保存输入保持不变；请先处理这些想法，再查看新版本。', 'warning');
     drawJobs(); controls();
   } catch { if (generation === state.generation) $('agent-status').textContent = '暂时连不上制作进度，稍后会再试。没有把断线当成制作完成。'; }
   finally { if (generation === state.generation) state.timer = setTimeout(() => pollJobs(generation), 1800); }
@@ -522,7 +704,8 @@ function drawMovie() {
   const latest = entries.find(entry => safeId(entry.assetId));
   const movie = $('movie-player');
   movie.hidden = !latest; $('movie-empty').hidden = !!latest;
-  if (!latest) { movie.pause(); movie.removeAttribute('src'); $('movie-info').textContent = ''; return; }
+  if (!latest) { state.watched = null; movie.pause(); movie.removeAttribute('src'); $('movie-info').textContent = ''; return; }
+  state.watched = { assetId: latest.assetId, inputRevision: Number.isSafeInteger(latest.inputRevision) ? latest.inputRevision : null };
   const url = assetUrl(state.project.id, latest.assetId);
   if (movie.getAttribute('src') !== url) { movie.pause(); movie.src = url; }
   $('movie-info').textContent = `${latest.preview ? '预览电影' : '已完成的电影'}${latest.inputRevision ? ` · 来自故事本第 ${latest.inputRevision} 版` : ''}。请先看一看、听一听，再告诉助手想改什么。`;
@@ -552,7 +735,7 @@ async function refreshHealth() {
 }
 for (const key of ['title', 'story']) $(key).addEventListener('input', () => { state.draft[key] = $(key).value; mark(key); });
 for (const key of ['director', 'voice']) $(key).addEventListener('input', () => { state.draft.credits[key] = $(key).value; mark('credits'); });
-$('save').addEventListener('click', () => task(async () => { await saveDraft(); notice('新的想法保存好啦。'); }));
+$('save').addEventListener('click', () => task(async () => { await saveDraft(true); notice('新的想法保存好啦。'); }));
 $('new-project').addEventListener('click', () => task(createProject)); $('welcome-create').addEventListener('click', () => task(createProject));
 $('refresh-health').addEventListener('click', refreshHealth);
 $('add-character').addEventListener('click', () => { state.draft.characters.push({ id: uid(), name: '新角色', color: '#317a72' }); mark('characters'); drawCharacters(); drawScenes(); controls(); });
@@ -560,15 +743,17 @@ $('photo-files').addEventListener('change', event => { const files = [...event.t
 $('audio-file').addEventListener('change', event => { const file = event.target.files[0]; event.target.value = ''; if (file) task(() => uploadRecording(file)); });
 $('start-recording').addEventListener('click', () => task(startRecording));
 $('stop-recording').addEventListener('click', () => { if (state.recorder?.state === 'recording') state.recorder.stop(); });
-$('retry-recording').addEventListener('click', () => { if (state.pendingRecording) task(() => uploadRecording(state.pendingRecording)); });
+$('retry-recording').addEventListener('click', () => { if (state.pendingRecording) task(() => uploadRecording(state.pendingRecording, true)); });
 $('auto-align').addEventListener('click', () => task(alignAutomatically));
 $('preview').addEventListener('click', () => task(() => makeMovie(true))); $('export').addEventListener('click', () => task(() => makeMovie(false)));
 $('agent-create').addEventListener('click', () => task(() => sendAgent(false))); $('send-feedback').addEventListener('click', () => task(() => sendAgent(true)));
 $('submit-markers').addEventListener('click', () => task(submitMarkers));
-$('add-extra-marker').addEventListener('click', () => { state.extras.push({ id: uid(), text: '', start: null, end: null }); drawExtraMarkers(); });
+$('add-extra-marker').addEventListener('click', () => { state.markerDirty = true; state.extras.push({ id: uid(), text: '', start: null, end: null }); drawExtraMarkers(); });
 $('load-history').addEventListener('click', () => task(loadHistory));
 $('manual-markers').addEventListener('toggle', () => { if ($('manual-markers').open && state.project) drawMarkers(); });
+for (const event of ['timeupdate', 'seeking', 'ratechange']) $('recording-player').addEventListener(event, checkSnippet);
+for (const event of ['pause', 'ended', 'emptied']) $('recording-player').addEventListener(event, () => { if ($('recording-player').paused || $('recording-player').ended) stopSnippet(false); });
 document.addEventListener('play', event => { if (event.target instanceof HTMLMediaElement) document.querySelectorAll('audio,video').forEach(media => { if (media !== event.target) media.pause(); }); }, true);
-window.addEventListener('beforeunload', event => { if (state.dirty.size || state.recorder || state.pendingRecording) { event.preventDefault(); event.returnValue = ''; } });
+window.addEventListener('beforeunload', event => { if (state.dirty.size || state.markerDirty || state.recorder || state.pendingRecording) { event.preventDefault(); event.returnValue = ''; } });
 window.addEventListener('pagehide', () => { stopPolling(); clearInterval(state.recordTimer); state.stream?.getTracks().forEach(track => track.stop()); });
 await Promise.all([refreshHealth(), listProjects().catch(error => notice(friendly(error), 'error'))]);

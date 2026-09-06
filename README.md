@@ -2,7 +2,7 @@
 
 把孩子自己的故事、照片、台词和**一整段配音**，做成一部可以观看、修改和导出的剪纸小电影。
 
-> **开发中，尚未发布最终安装版。** 真实HTTP导入、浏览器整段录音、对齐、MP4渲染、可逆剪辑、持久化任务及正式Cordis挂载已通过测试；目前还在补齐Agent异步任务接续、页面回复/待确认修改与发布验收。进度见 [实施状态](docs/implementation-status.md)，跟踪 [Issue #1](https://github.com/cloga/dsh-paper-director/issues/1)。
+> **v0.1.0 预览版**：独立的 DSH 插件＋儿童创作工作室，面向成人监督的本机使用。支持整段录音、Agent异步制作接续、试听确认剪辑和真实MP4导出。请先读 [安装步骤](docs/install.md)、[版本范围](docs/v0.1-scope.md) 和 [验证说明](docs/verification.md)。发布状态与源码版本以 [GitHub Releases](https://github.com/cloga/dsh-paper-director/releases) 为准。
 
 ## 创作流程
 
@@ -25,7 +25,7 @@
 
 ## 开发验证
 
-Node.js 22.19+（当前测试24.x），Python 3.11+。当前兼容基线为 **DSH 0.1.2-rc.1 / Cordis 4.0.2 / React 19.2.8**。
+Node.js 22.19+（当前测试24.x），Python 3.11+。兼容基线为 **DSH 0.1.2-rc.1 / Cordis 4.0.2**。侧栏插件只使用宿主共享的 `React.createElement`，已分别验证 React **18.3.1 和 19.2.8**；当前安装版浏览器 seed/生产依赖闭包是18.3.1，SDK根开发依赖是19.2.8，不能把两者混为同一个运行实例。
 
 当前安装版 SDK 的 Cordis 4.0.2 尚不能从已配置的 npm registry 安装（ETARGET）。**不会静默降级SDK，也不提供镜像绕过。** 在已有对应 DSH 安装的开发机上，可显式链接该SDK：
 
