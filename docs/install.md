@@ -1,5 +1,7 @@
 # 安装与验证（成人操作）
 
+> 第一次使用？先看 [图文上手：成人安装 → 配置 → 孩子创作 → 看/改电影](quick-start.md)，再按本页完成安装与安全验收。图文中的安装流程图、配置关系图是解释型示意图，不是真实操作截图；工作室截图/GIF 使用隔离 UI、匿名几何图与合成音调、人工时标和真实 Core 渲染，不代表真人录音、真实 ASR 或收费模型验证。演示媒体仅在仓库文档中提供，不改变发行包排除二进制媒体的规则。
+
 ## 状态与兼容性
 
 目标是 **DSH 0.1.2-rc.1 / Cordis 4.0.2 / Schemastery 3.18.2**。侧栏只使用宿主共享 React 的 createElement，已分别验证生产闭包/磁盘shell的 **18.3.1** 与SDK根开发版本 **19.2.8**，可选peer范围为 `>=18.3.1 <20`；不是把两份React混合使用。开发时 npm registry 对 `@deepseek-ai/cordis@4.0.2` 返回 **ETARGET**；不要降到4.0.1或改镜像。正式DSH会通过其 `healProfilesModuleFallback` 提供已安装SDK依赖，这与源码开发的显式link不同。尚未验证其他DSH版本。
@@ -64,7 +66,13 @@ autoInstallPeers: false
 
 **旧 Profile 的 `pnpm-workspace.yaml` 不会自动重写**。成人应先查看 `${DSH_HOME:-~/.dsh}/profiles/<profile>/pnpm-workspace.yaml` 和实际 pnpm 设置，不能把新模板当成旧配置。不要为了本插件自动更改现有 Profile。禁止自动安装 peer 不代表不存在的 SDK 会凭空可用；仍须验证 Host 中同一套 SDK 的解析。
 
-以下任选一个来源，`<profile>`、`<reviewed-commit>` 等为必须替换的占位符：
+已发布 v0.1.0 的快速安装命令如下；将 `<真实profile>` 替换为前面确认的真实名称（不是根据 GUI 端口猜测），之后仍须完成独立用户 preset 和 Python 配置步骤：
+
+```sh
+dsh plugin --profile <真实profile> add github:cloga/dsh-paper-director#v0.1.0 --ignore-scripts
+```
+
+其他来源如下任选其一，`<profile>`、`<reviewed-commit>` 等为必须替换的占位符：
 
 ```sh
 # 已检查的本地 tarball：从 tarball 所在目录调用；开头 ./ 保证按调用目录锚定
