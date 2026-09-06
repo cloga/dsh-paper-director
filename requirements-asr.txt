@@ -1,0 +1,4 @@
+-r requirements.txt
+# Optional adapters; administrators must separately provision complete LOCAL models.
+faster-whisper>=1.1,<2
+vosk>=0.3.45,<0.4

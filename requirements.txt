@@ -1,0 +1,4 @@
+# Independent media kernel (Python 3.11+). No model downloads performed by the worker.
+av>=18,<19
+numpy>=2,<3
+Pillow>=11,<13
