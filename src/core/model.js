@@ -27,17 +27,17 @@ function array(value, max, label) {
   return value
 }
 function unique(items, label) { const ids = items.map(x => x.id); if (new Set(ids).size !== ids.length) fail('DUPLICATE_ID', `Duplicate ${label}`) }
-export const DEFAULT_STYLE = Object.freeze({ width: 1280, height: 960, fps: 25, introSeconds: 3, outroSeconds: 4, comic: true, narrationAssetId: null, narrationText: '', travelSoundAssetId: null, timeSoundAssetId: null })
+export const DEFAULT_STYLE = Object.freeze({ width: 1280, height: 960, fps: 25, introSeconds: 3, outroSeconds: 4, comic: true, soundEffects: true, narrationAssetId: null, narrationText: '', travelSoundAssetId: null, timeSoundAssetId: null })
 export function normalizeStyle(input = {}, previous = DEFAULT_STYLE) {
   object(input, 'style')
   const known = new Set(Object.keys(DEFAULT_STYLE))
   for (const key of Object.keys(input)) if (!known.has(key)) fail('UNKNOWN_FIELD', `Unknown style field ${key}`)
-  const s = { ...previous, ...input }
+  const s = { ...DEFAULT_STYLE, ...previous, ...input }
   finite(s.width, 320, 1920, 'width'); finite(s.height, 240, 1920, 'height')
   if (!Number.isInteger(s.width) || !Number.isInteger(s.height) || s.width % 2 || s.height % 2 || s.width * s.height > 3686400) fail('INVALID_SIZE', 'Video dimensions must be bounded even integers')
   if (![24, 25, 30].includes(s.fps)) fail('INVALID_FPS', 'Use 24, 25 or 30 fps')
   finite(s.introSeconds, 0, 10, 'introSeconds'); finite(s.outroSeconds, 0, 15, 'outroSeconds')
-  if (typeof s.comic !== 'boolean') fail('INVALID_STYLE', 'comic must be boolean')
+  if (typeof s.comic !== 'boolean' || typeof s.soundEffects !== 'boolean') fail('INVALID_STYLE', 'comic and soundEffects must be booleans')
   s.narrationText = text(s.narrationText, 500, 'narrationText')
   for (const key of ['narrationAssetId', 'travelSoundAssetId', 'timeSoundAssetId']) if (s[key] !== null) id(s[key], key)
   return s
@@ -54,6 +54,7 @@ export function normalizeAuthorPatch(project, input) {
     p.characters = array(input.characters, 8, 'characters').map(c => {
       object(c, 'character'); const color = text(c.color, 7, 'color', '#b34470')
       if (!/^#[0-9a-f]{6}$/i.test(color)) fail('INVALID_COLOR', 'Character color must be a six-digit hex value')
+      if (['both','narrator'].includes(c.id)) fail('RESERVED_CHARACTER', 'Reserved identity cannot name a character')
       return { id: id(c.id || randomUUID(), 'character id'), name: text(c.name, 40, 'character name') || '角色', color }
     })
     unique(p.characters, 'character id')
@@ -70,7 +71,9 @@ export function normalizeAuthorPatch(project, input) {
           return { id: id(d.id || randomUUID(), 'dialogue id'), characterId: id(d.characterId, 'speaker'), text: text(d.text, 1000, 'dialogue text'), mode }
         }) }
     })
-    unique(p.scenes, 'scene id'); unique(p.scenes.flatMap(s => s.dialogue), 'dialogue id')
+    const lines=p.scenes.flatMap(s => s.dialogue)
+    if(lines.length>2048)fail('TOO_MANY_LINES','A project supports at most 2048 dialogue lines')
+    unique(p.scenes, 'scene id'); unique(lines, 'dialogue id')
   }
   if ('recordingAssetId' in input) p.recordingAssetId = input.recordingAssetId === null ? null : id(input.recordingAssetId)
   if ('style' in input) p.style = normalizeStyle(input.style, p.style)
@@ -93,10 +96,12 @@ export function newProject(input = {}) {
     scenes: [], recordingAssetId: null, assets: [], alignment: null, edits: [], style: { ...DEFAULT_STYLE }, exports: [] }
   return normalizeAuthorPatch(p, input)
 }
-export function probeMetadata(value = {}) {
+export function probeMetadata(value = {},{maxDuration=600}={}) {
   object(value, 'metadata'); const result = {}
-  for (const key of ['duration', 'sampleRate', 'channels', 'width', 'height', 'audioStreams', 'videoStreams']) if (value[key] !== undefined) result[key] = finite(value[key], 0, key === 'duration' ? 600 : key === 'sampleRate' ? 192000 : 100000, key)
+  for (const key of ['duration', 'sampleRate', 'channels', 'width', 'height', 'audioStreams', 'videoStreams']) if (value[key] !== undefined) result[key] = finite(value[key], 0, key === 'duration' ? maxDuration : key === 'sampleRate' ? 192000 : 100000, key)
   if (result.width && result.height && result.width * result.height > 24000000) fail('IMAGE_TOO_LARGE', 'Image exceeds 24 megapixels')
   if (value.codec !== undefined) result.codec = text(value.codec, 80, 'codec')
+  if (value.audioClock==='decoded-samples') result.audioClock='decoded-samples'
+  for (const key of ['containerDuration','timestampDuration']) if(value[key]!==undefined) result[key]=finite(value[key],0,maxDuration+.1,key)
   return result
 }

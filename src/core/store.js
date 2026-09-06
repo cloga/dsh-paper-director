@@ -4,7 +4,7 @@ import path from 'node:path'
 import { randomUUID, createHash } from 'node:crypto'
 import { clone, fail, id, newProject, normalizeAuthorPatch, probeMetadata, text } from './model.js'
 
-const TYPES = { 'image/png':'png', 'image/jpeg':'jpg', 'image/webp':'webp', 'audio/wav':'wav', 'audio/mpeg':'mp3', 'audio/mp4':'m4a', 'audio/ogg':'ogg', 'audio/webm':'webm', 'video/mp4':'mp4' }
+const TYPES = { 'image/png':'png', 'image/jpeg':'jpg', 'image/webp':'webp', 'audio/wav':'wav', 'audio/flac':'flac', 'audio/mpeg':'mp3', 'audio/mp4':'m4a', 'audio/ogg':'ogg', 'audio/webm':'webm', 'video/mp4':'mp4' }
 function sniff(bytes, mime) {
   if (mime === 'image/png') return bytes.subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10]))
   if (mime === 'image/jpeg') return bytes[0]===255 && bytes[1]===216 && bytes[2]===255
@@ -12,34 +12,48 @@ function sniff(bytes, mime) {
   if (mime === 'audio/wav') return bytes.toString('ascii',0,4)==='RIFF' && bytes.toString('ascii',8,12)==='WAVE'
   if (mime === 'audio/mpeg') return bytes.toString('ascii',0,3)==='ID3' || (bytes[0]===255 && (bytes[1]&224)===224)
   if (mime.endsWith('/mp4')) return bytes.toString('ascii',4,8)==='ftyp'
+  if (mime === 'audio/flac') return bytes.toString('ascii',0,4)==='fLaC'
   if (mime === 'audio/ogg') return bytes.toString('ascii',0,4)==='OggS'
   if (mime === 'audio/webm') return bytes.subarray(0,4).equals(Buffer.from([26,69,223,163]))
   return false
 }
 export class ProjectStore {
-  constructor({ dataDir, maxAssetBytes = 100 * 1024 * 1024, maxProjectBytes = 512 * 1024 * 1024 } = {}) {
+  constructor({ dataDir, maxAssetBytes = 100 * 1024 * 1024, maxProjectBytes = 512 * 1024 * 1024, maxJobsPerProject=200 } = {}) {
     if (!dataDir) throw new Error('dataDir is required')
-    this.root = path.resolve(dataDir); this.maxAssetBytes=maxAssetBytes; this.maxProjectBytes=maxProjectBytes
+    this.root = path.resolve(dataDir); this.maxAssetBytes=maxAssetBytes; this.maxProjectBytes=maxProjectBytes;this.maxJobsPerProject=maxJobsPerProject
   }
   async init() {
     await fs.mkdir(this.root,{recursive:true,mode:0o700})
     this.root = await fs.realpath(this.root)
     await fs.mkdir(path.join(this.root,'assets'),{recursive:true,mode:0o700})
+    if(this.db)return this
     this.db = new DatabaseSync(path.join(this.root,'paper-director.sqlite'))
+    try {
     this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
+      CREATE TABLE IF NOT EXISTS runtime_lease(id INTEGER PRIMARY KEY CHECK(id=1),token TEXT NOT NULL,pid INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY, revision INTEGER NOT NULL, title TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS revisions(project_id TEXT NOT NULL REFERENCES projects(id), revision INTEGER NOT NULL, created_at TEXT NOT NULL, document TEXT NOT NULL, PRIMARY KEY(project_id,revision));
       CREATE TABLE IF NOT EXISTS assets(project_id TEXT NOT NULL REFERENCES projects(id), id TEXT NOT NULL, filename TEXT NOT NULL, document TEXT NOT NULL, PRIMARY KEY(project_id,id));
       CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), kind TEXT NOT NULL, revision INTEGER NOT NULL, status TEXT NOT NULL, document TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS jobs_project ON jobs(project_id);`)
+    this.#transaction(()=>{
+      const lease=this.db.prepare('SELECT token,pid FROM runtime_lease WHERE id=1').get()
+      if(lease){let alive=true;try{process.kill(lease.pid,0)}catch(e){if(e.code==='ESRCH')alive=false}if(alive)fail('STORE_IN_USE','另一个工作室进程正在使用此数据目录。',503)}
+      this.leaseToken=randomUUID()
+      this.db.prepare('INSERT INTO runtime_lease(id,token,pid) VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET token=excluded.token,pid=excluded.pid').run(this.leaseToken,process.pid)
+    })
+    const columns=this.db.prepare('PRAGMA table_info(jobs)').all()
+    if(!columns.some(c=>c.name==='request_key'))this.db.exec('ALTER TABLE jobs ADD COLUMN request_key TEXT')
+    this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS jobs_request_key ON jobs(project_id,kind,revision,request_key) WHERE status IN ('queued','running','succeeded')")
     await fs.chmod(path.join(this.root,'paper-director.sqlite'),0o600)
     // A process crash is not permission to repeat a cloud call or silently finish an old revision.
     for (const row of this.db.prepare("SELECT id,document FROM jobs WHERE status IN ('queued','running')").all()) {
       const job=JSON.parse(row.document);job.status='interrupted';job.error={code:'PROCESS_RESTARTED',message:'制作任务被重启中断，请检查后重新制作。'};job.updatedAt=new Date().toISOString();this.#jobSave(job)
     }
     return this
+    } catch(error){this.close();throw error}
   }
-  #transaction(fn) { this.db.exec('BEGIN IMMEDIATE'); try {const result=fn();this.db.exec('COMMIT');return result} catch(e){this.db.exec('ROLLBACK');throw e} }
+  #transaction(fn) { this.db.exec('BEGIN IMMEDIATE');this.inTransaction=true;try{const result=fn();this.db.exec('COMMIT');return result}catch(e){this.db.exec('ROLLBACK');throw e}finally{this.inTransaction=false} }
   #row(projectId) { id(projectId,'project id');const row=this.db.prepare('SELECT * FROM projects WHERE id=?').get(projectId);if(!row)fail('PROJECT_NOT_FOUND','找不到这部作品。',404);return row }
   #document(projectId,revision) {const row=this.db.prepare('SELECT document FROM revisions WHERE project_id=? AND revision=?').get(projectId,revision);if(!row)fail('REVISION_NOT_FOUND','找不到这个版本。',404);return JSON.parse(row.document)}
   #save(project) {
@@ -74,7 +88,9 @@ export class ProjectStore {
   async update(projectId,revision,patch) {return this.mutate(projectId,revision,p=>normalizeAuthorPatch(p,patch))}
   async history(projectId) {this.#row(projectId);return this.db.prepare('SELECT revision,created_at AS createdAt FROM revisions WHERE project_id=? ORDER BY revision DESC LIMIT 500').all(projectId).map(row=>({...row}))}
   async restore(projectId,expectedRevision,revision) {const previous=await this.get(projectId,revision);return this.mutate(projectId,expectedRevision,()=>clone(previous))}
-  async addAsset(projectId,expectedRevision,{name,kind,mime,buffer,metadata={}}) {
+  usage(projectId) {this.#row(projectId);const row=this.db.prepare("SELECT COUNT(*) AS count,COALESCE(SUM(json_extract(document,'$.bytes')),0) AS bytes FROM assets WHERE project_id=?").get(projectId);return {count:row.count,bytes:row.bytes}}
+  checkAssetQuota(projectId,bytes){const used=this.usage(projectId);if(used.count>=300||used.bytes+bytes>this.maxProjectBytes)fail('PROJECT_QUOTA','包含历史版本的素材已达到容量限制。',413)}
+  async addAsset(projectId,expectedRevision,{name,kind,mime,buffer,metadata={}},{signal,onProject}={}) {
     const current=await this.get(projectId)
     if(current.revision!==expectedRevision)fail('REVISION_CONFLICT','作品已经更新，请刷新后再导入。',409)
     if(!['image','audio','video'].includes(kind)||!TYPES[mime]||!(Buffer.isBuffer(buffer)||buffer instanceof Uint8Array))fail('UNSUPPORTED_MEDIA','请选择支持的图片或录音文件。',415)
@@ -82,17 +98,20 @@ export class ProjectStore {
     if(!bytes.length||bytes.length>this.maxAssetBytes)fail('ASSET_TOO_LARGE','这个文件过大或为空。',413)
     if(!sniff(bytes,mime))fail('MEDIA_TYPE_MISMATCH','文件实际格式与媒体类型不一致。',415)
     if(kind==='image'&&!mime.startsWith('image/')||kind==='audio'&&!mime.startsWith('audio/')||kind==='video'&&mime!=='video/mp4')fail('MEDIA_TYPE_MISMATCH','Invalid asset kind',415)
-    if(current.assets.length>=300 || current.assets.reduce((n,a)=>n+a.bytes,0)+bytes.length>this.maxProjectBytes)fail('PROJECT_QUOTA','这部作品的素材达到容量限制。',413)
+    this.checkAssetQuota(projectId,bytes.length)
+    if(signal?.aborted)fail('CANCELLED','任务已取消。')
     const assetId=randomUUID(),filename=assetId+'.'+TYPES[mime]
     const directory=path.join(this.root,'assets',id(projectId));await fs.mkdir(directory,{recursive:true,mode:0o700})
-    const actual=await fs.realpath(directory);if(!this.#contained(actual))fail('UNSAFE_PATH','素材目录不可用。',403)
+    const actual=await fs.realpath(directory);if(!this.#contained(actual)||path.relative(actual,directory)!=='')fail('UNSAFE_PATH','素材目录不可用。',403)
     const file=path.join(actual,filename)
-    const asset={id:assetId,name:text(name,240,'asset name','素材').replace(/[\\/]/g,'_'),kind,mime,bytes:bytes.length,sha256:createHash('sha256').update(bytes).digest('hex'),metadata:probeMetadata(metadata)}
+    const asset={id:assetId,name:text(name,240,'asset name','素材').replace(/[\\/]/g,'_'),kind,mime,bytes:bytes.length,sha256:createHash('sha256').update(bytes).digest('hex'),metadata:probeMetadata(metadata,{maxDuration:kind==='video'?900:600})}
     await fs.writeFile(file,bytes,{flag:'wx',mode:0o600})
     try {
+      if(signal?.aborted)fail('CANCELLED','任务已取消。')
       const project=await this.mutate(projectId,expectedRevision,p=>{
+        this.checkAssetQuota(projectId,bytes.length)
         this.db.prepare('INSERT INTO assets(project_id,id,filename,document) VALUES(?,?,?,?)').run(projectId,assetId,filename,JSON.stringify(asset))
-        p.assets.push(asset);return p
+        p.assets.push(asset);return onProject?onProject(p,asset):p
       })
       return {project,asset}
     } catch(e){await fs.unlink(file).catch(()=>{});throw e}
@@ -111,14 +130,25 @@ export class ProjectStore {
   }
   #jobSave(job) {this.db.prepare('UPDATE jobs SET status=?,document=? WHERE id=?').run(job.status,JSON.stringify(job),job.id)}
   async jobCreate(projectId,kind,revision,input={}) {
-    const p=await this.get(projectId)
-    if(p.revision!==revision)fail('REVISION_CONFLICT','作品已经更新，请刷新后再制作。',409)
-    const now=new Date().toISOString(),job={id:randomUUID(),projectId,kind,revision,status:'queued',progress:0,stage:'queued',createdAt:now,updatedAt:now,input:clone(input),result:null,error:null}
-    this.db.prepare('INSERT INTO jobs(id,project_id,kind,revision,status,document) VALUES(?,?,?,?,?,?)').run(job.id,projectId,kind,revision,job.status,JSON.stringify(job))
-    return clone(job)
+    return this.#transaction(()=>{
+      const p=this.#row(projectId)
+      if(p.revision!==revision)fail('REVISION_CONFLICT','作品已经更新，请刷新后再制作。',409)
+      const key=typeof input.fingerprint==='string'?input.fingerprint:null
+      if(key){const row=this.db.prepare("SELECT document FROM jobs WHERE project_id=? AND kind=? AND revision=? AND request_key=? AND status IN ('queued','running','succeeded')").get(projectId,kind,revision,key);if(row)return {...JSON.parse(row.document),reused:true}}
+      if(kind==='narration'&&input.ttsFingerprint){
+        const prior=this.db.prepare("SELECT document FROM jobs WHERE project_id=? AND kind='narration' AND json_extract(document,'$.input.ttsFingerprint')=? AND (status IN ('queued','running','succeeded','interrupted') OR json_extract(document,'$.error.code')='TTS_UNCERTAIN') LIMIT 1").get(projectId,input.ttsFingerprint)
+        if(prior)return {...JSON.parse(prior.document),reused:true}
+      }
+      if(this.db.prepare('SELECT COUNT(*) AS n FROM jobs WHERE project_id=?').get(projectId).n>=this.maxJobsPerProject)fail('JOB_LIMIT','这部作品的任务数量达到限制。',429)
+      const now=new Date().toISOString(),job={id:randomUUID(),projectId,kind,revision,status:'queued',progress:0,stage:'queued',createdAt:now,updatedAt:now,input:clone(input),result:null,error:null}
+      this.db.prepare('INSERT INTO jobs(id,project_id,kind,revision,status,document,request_key) VALUES(?,?,?,?,?,?,?)').run(job.id,projectId,kind,revision,job.status,JSON.stringify(job),key)
+      return clone(job)
+    })
   }
-  async jobGet(jobId) {id(jobId,'job id');const row=this.db.prepare('SELECT document FROM jobs WHERE id=?').get(jobId);if(!row)fail('JOB_NOT_FOUND','找不到制作任务。',404);return JSON.parse(row.document)}
+  jobRead(jobId) {id(jobId,'job id');const row=this.db.prepare('SELECT document FROM jobs WHERE id=?').get(jobId);if(!row)fail('JOB_NOT_FOUND','找不到制作任务。',404);return JSON.parse(row.document)}
+  async jobGet(jobId) {return this.jobRead(jobId)}
+  finishJobInMutation(jobId,result){if(!this.inTransaction)throw new Error('Job completion must share the project transaction');const job=this.jobRead(jobId);Object.assign(job,{status:'succeeded',stage:'complete',progress:1,result:clone(result),error:null,updatedAt:new Date().toISOString()});this.#jobSave(job)}
   async jobUpdate(jobId,patch) {const job=await this.jobGet(jobId);for(const key of Object.keys(patch))if(!['status','progress','stage','result','error'].includes(key))throw new Error('Invalid internal job field');Object.assign(job,clone(patch),{updatedAt:new Date().toISOString()});this.#jobSave(job);return clone(job)}
   async jobs(projectId) {this.#row(projectId);return this.db.prepare('SELECT document FROM jobs WHERE project_id=? ORDER BY rowid DESC LIMIT 200').all(projectId).map(r=>JSON.parse(r.document))}
-  close() {this.db?.close();this.db=undefined}
+  close() {if(!this.db)return;try{if(this.leaseToken)this.db.prepare('DELETE FROM runtime_lease WHERE id=1 AND token=?').run(this.leaseToken)}finally{this.leaseToken=undefined;this.db.close();this.db=undefined}}
 }

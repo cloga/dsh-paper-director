@@ -1,0 +1,114 @@
+name: Verify package and anonymous media
+
+on:
+  push:
+    branches: [main, 'feature/**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  node-contracts:
+    name: Node ${{ matrix.node }} contracts and real npm artifact (SDK unavailable)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22.19.0', '24']
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+          package-manager-cache: false
+      # Plain JavaScript/core/contracts need no npm install. Do not downgrade Cordis,
+      # change registries, or convert an ETARGET into a fake successful SDK install.
+      - name: Run Node contracts, installer and real tarball checks without devDependencies
+        run: node --test tests/*.test.mjs
+        env:
+          DSH_ADAPTER_SDK_ROOT: ''
+      - name: Record exactly what this job did not verify
+        run: |
+          echo '### Node contract/package checks' >> "$GITHUB_STEP_SUMMARY"
+          echo 'No npm install was attempted. Cordis 4.0.2 returned ETARGET during development.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Actual SDK schema and bundle-resolver tests explicitly SKIP without DSH_ADAPTER_SDK_ROOT.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Contract doubles and tarball checks are NOT a real DSH install, preset mount or browser/model turn.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Python-gated tests are exercised separately in the anonymous-media job.' >> "$GITHUB_STEP_SUMMARY"
+
+  anonymous-media:
+    name: Real Python codecs, Chinese fonts and anonymous media E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install CJK fonts and the independent Python media dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y fonts-noto-cjk
+          python -m pip install -r requirements.txt
+      - name: Verify Python worker contracts and actual render/codec output
+        run: python -m unittest discover -s tests/python -p 'test_*.py' -v
+      - name: Run anonymous synthetic media end to end (tones are not speech)
+        run: python tests/python/synthetic_demo.py --output-dir "$RUNNER_TEMP/paper-director-anonymous-demo"
+      - name: Run Node tests with the actual isolated Python worker enabled
+        run: |
+          export PAPER_DIRECTOR_TEST_PYTHON="$(command -v python)"
+          node --test tests/*.test.mjs
+        env:
+          DSH_ADAPTER_SDK_ROOT: ''
+      - name: Explain evidence boundaries
+        run: |
+          echo '### Anonymous media verification' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Real H.264/AAC render, decode, Chinese-font readiness and Python bridge; generated geometric images and oscillator tones only.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'No private media, ASR inference/quality, cloud narration, human listening, DSH install or real Agent turn is implied.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Actual DSH SDK schemas/bundle resolution still SKIP on this hosted runner: no verified SDK distribution was installed.' >> "$GITHUB_STEP_SUMMARY"
+
+  browser-media:
+    name: Browser studio with real HTTP and media rendering
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Prepare explicit isolated browser dependencies and media runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y fonts-noto-cjk
+          python -m pip install -r requirements.txt
+          npm install --prefix tests/ui/.deps --no-save --ignore-scripts --no-audit --no-fund playwright@1.63.0
+          node tests/ui/.deps/node_modules/playwright/cli.js install --with-deps chromium
+      - name: Test UI controls and actual HTTP video playback
+        run: |
+          export PAPER_DIRECTOR_TEST_PYTHON="$(command -v python)"
+          node --test tests/ui/studio.test.mjs tests/real-http.test.mjs
+      - name: Describe what was exercised
+        run: |
+          echo '### Browser integration' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Real HTTP upload/probe/align/render, native MP4 playback and generated MediaRecorder audio; anonymous fixtures only.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Provided transcript markers are not real ASR evidence. Authentication fixture and no live model; actual DSH validation is separate.' >> "$GITHUB_STEP_SUMMARY"

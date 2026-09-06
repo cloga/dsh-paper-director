@@ -71,7 +71,9 @@ export function proposePauseEdit(project,request) {
   const known=aligned.filter(u=>u.start!==null)
   if(cuts.some(c=>known.some(u=>overlap(c,u))))fail('SPEECH_PROTECTED','不能删除已对应的对白。')
   const uncertain=[...project.alignment.unmatchedSpeech,...project.alignment.speechRanges.filter(r=>!known.some(u=>u.start<=r.start&&u.end>=r.end))]
-  const warnings=cuts.some(c=>uncertain.some(r=>overlap(c,r)))?[{code:'UNMATCHED_SPEECH',message:'这里有尚未确认的发声，请先试听，不能直接当作静音。'}]:[]
+  // ASR tokens and manual markers do not establish that an untranscribed gap is silent.
+  const unverifiedManualGap=['provided_segments','local_whisper','local_vosk'].includes(project.alignment.method)&&cuts.length>0
+  const warnings=unverifiedManualGap||cuts.some(c=>uncertain.some(r=>overlap(c,r)))?[{code:unverifiedManualGap?'UNVERIFIED_GAP':'UNMATCHED_SPEECH',message:'这段空档尚未证实完全安静，请先试听确认，不能自动删除。'}]:[]
   const normalized={afterDialogueId:after.dialogueId,beforeDialogueId:before.dialogueId,targetSeconds}
   const proposal={projectId:project.id,baseRevision:project.revision,request:normalized,currentSeconds:snap(currentSeconds),targetSeconds,removedSeconds:snap(cuts.reduce((n,c)=>n+c.end-c.start,0)),cuts,warnings,requiresConfirmation:warnings.length>0}
   proposal.id=createHash('sha256').update(JSON.stringify(proposal)).digest('hex')
@@ -95,7 +97,7 @@ export function compileTimeline(project) {
   const assets=new Map(project.assets.map(a=>[a.id,a])),author=new Map(dialogue(project).map(d=>[d.id,d]))
   if(!assets.has(project.recordingAssetId))fail('UNKNOWN_RECORDING','录音素材不存在。')
   for(const s of project.scenes)if(!s.imageAssetId||assets.get(s.imageAssetId)?.kind!=='image')fail('MISSING_IMAGE','每一幕都需要图片。')
-  const cuts=checkedCuts(project),warnings=[]
+  const cuts=checkedCuts(project),warnings=[...(alignment.warnings||[])]
   if(alignment.utterances.some(u=>u.matchStatus!=='matched'))warnings.push({code:'ALIGNMENT_NEEDS_REVIEW',message:'部分台词的对应位置需要试听确认。'})
   if(alignment.unmatchedSpeech.length)warnings.push({code:'UNMATCHED_SPEECH_RETAINED',message:'未对应的发声仍保留在录音里。'})
   const spoken=project.scenes.map((s,index)=>({scene:s,index,lines:alignment.utterances.filter(u=>u.sceneId===s.id)})).filter(s=>s.lines.length)
@@ -108,7 +110,7 @@ export function compileTimeline(project) {
   const introNarration=style.narrationAssetId?assets.get(style.narrationAssetId):null
   const introSeconds=Math.max(style.introSeconds,introNarration?(introNarration.metadata.duration||0)+.65:0)
   let cursor=snap(introSeconds);const cues=[],subtitles=[],audioSegments=[],audioOverlays=[]
-  if(introNarration)audioOverlays.push({assetId:introNarration.id,start:.3,gainDb:-3})
+  if(introNarration)audioOverlays.push({assetId:introNarration.id,start:.3,gainDb:-3,maxDuration:Math.max(.01,introSeconds-.3)})
   let previousImage=null
   for(const scene of project.scenes){
     const range=sourceRanges.get(scene.id)
@@ -116,7 +118,7 @@ export function compileTimeline(project) {
       const duration=scene.transition==='magic'?.8:2.2
       cues.push({id:'transition-'+scene.id,sceneId:scene.id,imageAssetId:scene.imageAssetId,fromAssetId:previousImage,start:cursor,end:snap(cursor+duration),kind:scene.transition,timeLabel:scene.timeLabel||'过了一会儿'})
       const soundId=scene.transition==='magic'?style.travelSoundAssetId:style.timeSoundAssetId
-      if(soundId){const sound=assets.get(soundId);if(!sound)fail('UNKNOWN_AUDIO','过场音效不存在。');audioOverlays.push({assetId:soundId,start:cursor,gainDb:scene.transition==='magic'?-7:-12,maxDuration:duration})}
+      if(soundId&&style.soundEffects!==false){const sound=assets.get(soundId);if(!sound)fail('UNKNOWN_AUDIO','过场音效不存在。');audioOverlays.push({assetId:soundId,start:cursor,gainDb:scene.transition==='magic'?-7:-12,maxDuration:duration})}
       cursor=snap(cursor+duration)
     }
     const sceneStart=cursor

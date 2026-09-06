@@ -5,9 +5,9 @@ import math
 import re
 import av
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFont
 from .fonts import choose_font
-from .media import load_image, mix_audio
+from .media import load_image, mix_audio, DEFAULT_OVERLAY_SECONDS, MAX_OVERLAY_SECONDS
 from .safety import require, number, integer, text, identifier
 
 
@@ -73,21 +73,50 @@ def validate_timeline(timeline, assets):
             else:
                 require(entry.get("assetId") in assets, "INVALID_ASSET", "Overlay is not mapped.")
                 number(entry.get("gainDb", 0), "gainDb", -96, 12)
+                number(entry.get("maxDuration", DEFAULT_OVERLAY_SECONDS), "overlay maxDuration", 1 / 48000, MAX_OVERLAY_SECONDS)
                 entry.setdefault("gainDb", 0)
+    require(isinstance(timeline.get("warnings", []), list) and len(timeline.get("warnings", [])) <= 256,
+            "INVALID_TIMELINE", "Timeline warnings must be a bounded list.")
     return timeline
+
+
+def render_warnings(timeline_warnings, audio_warnings):
+    """Only fixed worker text leaves the renderer; input warning messages can contain paths."""
+    known = {
+        "ALIGNMENT_NEEDS_REVIEW": "Some dialogue timings need listening review before publication.",
+        "UNMATCHED_SPEECH_RETAINED": "Unmatched speech was retained in the recording; do not treat it as silence.",
+    }
+    safe_demo = "Synthetic tones are not speech; captions are provided author text, not ASR."
+    result = []
+    for warning in timeline_warnings:
+        code = warning.get("code") if isinstance(warning, dict) else None
+        message = safe_demo if warning == safe_demo else known.get(code, "The compiled timeline contains review warnings; check the edit before publication.")
+        if message not in result:
+            result.append(message)
+    for message in audio_warnings:
+        if message not in result:
+            result.append(message)
+    return result[:32]
 
 
 class Painter:
     def __init__(self, timeline, assets, font_path=None):
-        self.timeline, self.assets = timeline, assets
+        self.timeline = timeline
+        referenced = {cue.get("imageAssetId") for cue in timeline.get("cues", []) if cue.get("imageAssetId")}
+        self.assets = {key: assets[key] for key in referenced if key in assets}
         self.width, self.height = timeline["width"], timeline["height"]
         self.scale = min(self.width / 1280, self.height / 960)
         self.characters = {c["id"]: c for c in timeline.get("characters", [])}
-        texts = [timeline.get("title", ""), "THE END", "DIRECTOR", "VOICE", "TIME", "NARRATOR"]
+        texts = [timeline.get("title", "")]
         texts += [str(v) for k, v in timeline.get("credits", {}).items() if k in ("director", "voice")]
         texts += [c["name"] for c in self.characters.values()]
         texts += [s["text"] for s in timeline.get("subtitles", [])]
         texts += [c.get("timeLabel", "") for c in timeline.get("cues", [])]
+        self.cjk = any(re.search(r"[\u3400-\u9fff\uf900-\ufaff\U00020000-\U0003134f]", value) for value in texts)
+        self.labels = ({"director": "导演", "voice": "配音", "end": "完", "thanks": "谢谢观看", "time": "时间", "narrator": "旁白"}
+                       if self.cjk else {"director": "DIRECTOR", "voice": "VOICE", "end": "THE END", "thanks": "THANK YOU FOR WATCHING", "time": "TIME", "narrator": "NARRATOR"})
+        # Validate the actual selected language template too, before any frames are made.
+        texts += list(self.labels.values())
         self.font_path = choose_font(font_path, texts)
         self.fonts, self.images = {}, OrderedDict()
         # Deterministic paper grain, shared by previews, frame and full exports.
@@ -132,13 +161,59 @@ class Painter:
     def image(self, asset_id, size):
         key = (asset_id, size)
         if key not in self.images:
-            self.images[key] = ImageOps.contain(load_image(self.assets[asset_id]["path"]), size, Image.Resampling.LANCZOS)
-            while len(self.images) > 4:
-                self.images.popitem(last=False)
+            require(asset_id in self.assets, "INVALID_ASSET", "Only cue-referenced images may be drawn.")
+            # Evict before loading: at most four output-sized rasters, never project-wide
+            # originals. Source decode/downscale occurs only when a cue needs this image.
+            while len(self.images) >= 4:
+                _, old = self.images.popitem(last=False)
+                old.close()
+            self.images[key] = load_image(self.assets[asset_id]["path"], target_size=size)
         self.images.move_to_end(key)
         return self.images[key]
 
+    def credits_text(self):
+        credits = self.timeline.get("credits", {})
+        return "\n".join(self.labels[key] + "  " + credits[key]
+                         for key in ("director", "voice") if credits.get(key))
+
+    def outro_brightness(self, time):
+        """Fade only the requested outro, ending on the last actual video sample."""
+        duration = self.timeline["duration"]
+        outro = self.timeline.get("outroSeconds", 0)
+        if outro <= 0:
+            return 1.0
+        last_time = (math.ceil(duration * self.timeline["fps"]) - 1) / self.timeline["fps"]
+        if time >= last_time:
+            return 0.0
+        fade_start = max(duration - min(.5, outro), 0)
+        if time <= fade_start or last_time <= fade_start:
+            return 1.0
+        fraction = (time - fade_start) / (last_time - fade_start)
+        return 1 - fraction * fraction * (3 - 2 * fraction)
+
+    def frame_key(self, time):
+        """None means dynamic. Indices keep all simultaneous subtitle changes visible."""
+        brightness = self.outro_brightness(time)
+        if brightness == 0:
+            return ("black",)
+        if brightness < 1:
+            return None
+        if time < self.timeline.get("introSeconds", 0):
+            return ("intro",)
+        if time >= self.timeline["duration"] - self.timeline.get("outroSeconds", 0):
+            return ("outro",)
+        cue_index = next((i for i, cue in enumerate(self.timeline.get("cues", []))
+                          if cue["start"] <= time < cue["end"]), None)
+        if cue_index is not None and self.timeline["cues"][cue_index]["kind"] == "magic":
+            return None
+        active = tuple(i for i, subtitle in enumerate(self.timeline.get("subtitles", []))
+                       if subtitle["start"] <= time < subtitle["end"])
+        return ("scene", cue_index, active)
+
     def draw(self, time):
+        brightness = self.outro_brightness(time)
+        if brightness == 0:
+            return Image.new("RGB", (self.width, self.height), "black")
         image = self.paper.copy()
         draw = ImageDraw.Draw(image)
         w, h, scale = self.width, self.height, self.scale
@@ -148,16 +223,20 @@ class Painter:
         timeline = self.timeline
         if time < timeline.get("introSeconds", 0):
             self.block(draw, timeline.get("title", ""), (w * .12, h * .22, w * .88, h * .68), 78)
-            credit = timeline.get("credits", {}).get("director", "")
-            if credit:
-                self.block(draw, "DIRECTOR  " + credit, (w * .15, h * .70, w * .85, h * .88), 32)
+            credits = self.credits_text()
+            if credits:
+                self.block(draw, credits, (w * .15, h * .70, w * .85, h * .90), 32)
             return image
         if time >= timeline["duration"] - timeline.get("outroSeconds", 0):
-            self.block(draw, "THE END", (w * .15, h * .20, w * .85, h * .46), 84)
-            credits = timeline.get("credits", {})
-            value = "\n".join(label + "  " + credits[key] for key, label in (("director", "DIRECTOR"), ("voice", "VOICE")) if credits.get(key))
-            if value:
-                self.block(draw, value, (w * .12, h * .51, w * .88, h * .85), 36)
+            self.block(draw, self.labels["end"], (w * .15, h * .18, w * .85, h * .43), 84)
+            self.block(draw, self.labels["thanks"], (w * .15, h * .44, w * .85, h * .54), 32)
+            credits = self.credits_text()
+            if credits:
+                self.block(draw, credits, (w * .12, h * .57, w * .88, h * .87), 36)
+            if brightness < 1:
+                faded = image.point([round(value * brightness) for value in range(256)] * 3)
+                image.close()
+                return faded
             return image
         cue = next((c for c in timeline.get("cues", []) if c["start"] <= time < c["end"]), None)
         if cue:
@@ -171,7 +250,7 @@ class Painter:
                 draw.rectangle((x - border, y - border, x + picture.width + border, y + picture.height + border), outline="#fff9e9", width=border)
             if cue["kind"] == "time":
                 draw.rounded_rectangle((w * .10, h * .28, w * .90, h * .63), radius=round(18 * scale), fill="#fff9e9", outline="#302c28", width=border)
-                self.block(draw, cue.get("timeLabel") or "TIME", (w * .14, h * .31, w * .86, h * .60), 64)
+                self.block(draw, cue.get("timeLabel") or self.labels["time"], (w * .14, h * .31, w * .86, h * .60), 64)
             elif cue["kind"] == "magic":
                 phase = (time - cue["start"]) / (cue["end"] - cue["start"])
                 cx, cy = w / 2, h * .40
@@ -229,7 +308,7 @@ class Painter:
                 else:
                     draw.rounded_rectangle((left, y0, left + box_width, y1), radius=max(3, round(12 * scale)), fill=fill, outline="#302c28", width=border)
                 character_id = subtitle["characterId"]
-                name = self.characters.get(character_id, {}).get("name", "NARRATOR" if character_id == "narrator" else " / ".join(c["name"] for c in list(self.characters.values())[:2]))
+                name = self.characters.get(character_id, {}).get("name", self.labels["narrator"] if character_id == "narrator" else " / ".join(c["name"] for c in list(self.characters.values())[:2]))
                 self.block(draw, name + ": " + subtitle["text"], (left + box_width * .06, y0 + 3 * scale, left + box_width * .94, y1 - 3 * scale), 36 if mode in ("small", "thought") else 44)
         return image
 
@@ -259,8 +338,16 @@ def render(request, output_dir, assets, progress):
         sound.bit_rate = 192000
         converter = av.video.reformatter.VideoReformatter()
         audio_position = 0
+        composed, composed_key = None, None
         for index in range(frame_count):
-            frame = av.VideoFrame.from_image(painter.draw(index / fps))
+            time = index / fps
+            key = painter.frame_key(time)
+            if composed is None or key is None or key != composed_key:
+                if composed is not None:
+                    composed.close()
+                composed = painter.draw(time)
+                composed_key = key
+            frame = av.VideoFrame.from_image(composed)
             frame = converter.reformat(frame, format="yuv420p", src_colorspace="ITU709", dst_colorspace="ITU709", src_color_range="JPEG", dst_color_range="MPEG", dst_color_trc=1, dst_color_primaries=1)
             frame.pts, frame.time_base = index, Fraction(1, fps)
             frame.color_range, frame.colorspace = 1, 1
@@ -276,11 +363,13 @@ def render(request, output_dir, assets, progress):
                 audio_position = end
             if index % max(1, fps) == 0:
                 progress(.1 + .85 * index / frame_count, "render", f"Encoded {index + 1}/{frame_count} frames.")
+        if composed is not None:
+            composed.close()
         for packet in video.encode(None):
             output.mux(packet)
         for packet in sound.encode(None):
             output.mux(packet)
     return {"path": "movie.mp4", "width": painter.width, "height": painter.height, "fps": fps,
             "duration": timeline["duration"], "frameCount": frame_count, "videoCodec": "h264", "audioCodec": "aac",
-            "colorSpace": "bt709", "colorRange": "limited", "warnings": list(timeline.get("warnings", [])) + warnings,
+            "colorSpace": "bt709", "colorRange": "limited", "warnings": render_warnings(timeline.get("warnings", []), warnings),
             "preview": bool(request.get("preview", False))}

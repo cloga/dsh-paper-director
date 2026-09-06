@@ -12,7 +12,7 @@
     "./client": "./lib/client.js",
     "./package.json": "./package.json"
   },
-  "files": ["index.js", "src", "lib/client.js", "web", "python", "presets", "cordis.patch.yml", "requirements.txt", "requirements-asr.txt", "README.md", "LICENSE", "docs"],
+  "files": ["index.js", "src/**/*.js", "lib/client.js", "web/*.html", "web/*.js", "web/*.css", "python/worker.py", "python/paper_director/*.py", "python/README.md", "presets/**/*.yml", "cordis.patch.yml", "requirements.txt", "requirements-asr.txt", "README.md", "LICENSE", "docs/*.md", "scripts/install-preset.mjs", "scripts/check-package.mjs"],
   "dsh": {
     "bundle": { "patch": "./cordis.patch.yml" },
     "client": { "platform": "web", "inject": ["@deepseek-ai/dsh-client-ui-sidebar"], "external": ["react"] }
@@ -22,7 +22,8 @@
     "test:python": "python -m unittest discover -s tests/python -v",
     "check": "node scripts/check-package.mjs",
     "verify": "npm test && npm run check",
-    "demo": "node scripts/demo.mjs"
+    "demo": "node scripts/demo.mjs",
+    "install:preset": "node scripts/install-preset.mjs"
   },
   "engines": { "node": ">=22.19.0" },
   "peerDependencies": {

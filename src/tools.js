@@ -12,11 +12,11 @@ const pause = {
   expectedRevision: revision,
   afterDialogueId: text('Dialogue immediately before the pause.'),
   beforeDialogueId: text('Dialogue immediately after the pause.'),
-  targetSeconds: { type: 'number', required: true, description: 'Remaining pause duration in seconds, from 0 to 30.' },
+  targetSeconds: { type: 'number', required: true, description: 'Remaining pause duration in seconds, from 0.25 to 3.' },
 }
 
 function pauseArgs(args) {
-  if (!Number.isFinite(args.targetSeconds) || args.targetSeconds < 0 || args.targetSeconds > 30) throw new Error('Invalid target pause length')
+  if (!Number.isFinite(args.targetSeconds) || args.targetSeconds < 0.25 || args.targetSeconds > 3) throw new Error('Invalid target pause length')
   for (const key of ['afterDialogueId', 'beforeDialogueId']) if (!idPattern.test(args[key])) throw new Error('Invalid dialogue identity')
   return { expectedRevision: args.expectedRevision, operation: { type: 'shorten_pause', afterDialogueId: args.afterDialogueId, beforeDialogueId: args.beforeDialogueId, targetSeconds: args.targetSeconds } }
 }
@@ -75,7 +75,7 @@ export function apply(ctx, config = {}) {
   register('paper_pause_propose', 'Propose shortening a pause between known dialogue. Show protected or unmatched speech warnings; this does not apply an edit.', pause, 'timeline.propose', pauseArgs)
   register('paper_pause_apply', 'Apply the pause change explicitly requested by the human. Never delete unmatched speech; protected ranges remain blocked.', pause, 'timeline.apply', (args) => ({ ...pauseArgs(args), allowUnmatchedSpeech: false }))
   register('paper_narration', 'Generate adult-enabled Azure narration from approved text ONLY. Cloud narration is disabled by default; never send recordings.', { expectedRevision: revision, text: text('Exact text approved by the author for the narrator.') }, 'narration.generate', (args) => {
-    if (!args.text.trim() || args.text.length > 8000) throw new Error('Narration text must contain 1–8000 characters')
+    if (!args.text.trim() || args.text.length > 500) throw new Error('Narration text must contain 1–500 characters')
     return { expectedRevision: args.expectedRevision, text: args.text, voiceProfile: 'narrator' }
   })
 }

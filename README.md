@@ -2,7 +2,7 @@
 
 把孩子自己的故事、照片、台词和**一整段配音**，做成一部可以观看、修改和导出的剪纸小电影。
 
-> **开发中，尚未发布可安装版本。** 项目核心、媒体内核、DSH接入和儿童界面已有实现；目前还在连接真实HTTP/任务服务及完成端到端验收。不要把独立模块测试通过理解为完整产品已经可以安装使用。进度见 [实施状态](docs/implementation-status.md)，跟踪 [Issue #1](https://github.com/cloga/dsh-paper-director/issues/1)。
+> **开发中，尚未发布最终安装版。** 真实HTTP导入、浏览器整段录音、对齐、MP4渲染、可逆剪辑、持久化任务及正式Cordis挂载已通过测试；目前还在补齐Agent异步任务接续、页面回复/待确认修改与发布验收。进度见 [实施状态](docs/implementation-status.md)，跟踪 [Issue #1](https://github.com/cloga/dsh-paper-director/issues/1)。
 
 ## 创作流程
 
@@ -42,6 +42,8 @@ python -m venv .venv
 python -m pip install -r requirements.txt
 python -m unittest discover -s tests/python -v
 python tests/python/synthetic_demo.py --output-dir tests/python/.artifacts/demo
+# Real Node application service → Python pipeline → revised MP4:
+npm run demo
 ```
 
 Python demo 使用新生成的匿名几何图片和音调；provided transcript 是显式测试输入，不冒充识别真实语音。真实ASR需要管理员准备本地模型，程序不自动下载模型或上传孩子的录音。
@@ -52,9 +54,11 @@ Python demo 使用新生成的匿名几何图片和音调；provided transcript 
 
 - 不包含开发家庭的照片、录音、电影或密钥。
 - 原始媒体不可变；修改产生新版本，可恢复。
-- Azure旁白默认关闭，只在成人配置后发送批准的文本，不发送完整录音。
-- 声音素材需要明确的来源与授权记录。
-- 自动技术检查不等于人工听感审核。
+- 媒体探测、录音对齐和渲染在本地运行，不自动上传原始录音。**点击“交给导演助手”后，故事、台词、分镜说明及转写文本会提供给家长配置的 DSH 模型；该模型可能是云端服务。** 这不等于所有信息都离线处理。
+- Azure旁白默认关闭，只在成人配置后发送批准的文本，不发送完整录音；每日5000字符保护仅针对旁白，Agent模型调用费用由DSH配置管理。
+- 内置星光与提示铃是原创合成音效（生成声音数据CC0-1.0），无需联网；可用 `style.soundEffects: false` 关闭。导入其他声音须明确来源与授权。
+- 自动技术检查不等于人工听感审核；录音时序采用已解码采样的顺序，遇到异常容器时间戳会提示核对。
+- **首版用于成人监督的单家庭/本机环境。** 受限Agent不等于浏览器或操作系统的儿童沙箱；共享DSH登录仍具有宿主本身的权限。不要当作独立儿童账号或公网多用户平台部署。
 
 ## License
 
